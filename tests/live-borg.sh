@@ -25,6 +25,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# --- scratch directories (keel requires the destination to exist) ---------
+mkdir -p "$DEST" "$RECV"
+
 step() { echo; echo "=== $* ==="; }
 check() { if [ "$1" -ne 0 ]; then echo "❌ FAIL: $2"; FAIL=1; else echo "✔ $2"; fi; }
 
@@ -77,8 +80,7 @@ step "verify stream artifact"
 zstd -tq "$STREAM"; check $? "zstd integrity of stream"
 
 step "verify stream content (btrfs receive)"
-mkdir -p "$RECV"
-btrfs receive -p "$RECV" <(zstd -dc "$STREAM")
+btrfs receive "$RECV" <(zstd -dc "$STREAM")
 check $? "btrfs receive"
 received=$(find "$RECV" -name hello.txt | head -1)
 [ -n "$received" ]; check $? "hello.txt inside received subvolume"
@@ -95,13 +97,13 @@ grep -q "bootstrapped" "$DAY/manifest.yaml" 2>/dev/null || true
 step "verify borg repo + bootstrap passphrase file"
 [ -f "$BP" ]; check $? "passphrase file created"
 stat -c '%a' "$BP" | grep -q 400; check $? "passphrase file is 0400"
-list1=$(BORG_PASSPHRASE="$(cat "$BP")" BORG_RELOCATED_REPO_ACCESS_IS_OK=yes borg list --short "$REPO")
+list1=$(BORG_PASSPHRASE="$(cat "$BP")" BORG_RELOCATED_REPO_ACCESS_IS_OK=yes borg list --short "$REPO" 2>/dev/null)
 echo "$list1"
-n1=$(echo "$list1" | wc -l)
-[ "$n1" -ge 1 ]; check $? "repo has >=1 archive"
+n1=$(echo "$list1" | grep -c 'live-[0-9]')
+[ "$n1" -ge 1 ]; check $? "repo has >=1 archive (found $n1)"
 
 step "verify borg content (extract --stdout)"
-arch1=$(echo "$list1" | tail -1)
+arch1=$(echo "$list1" | grep 'live-[0-9]' | tail -1)
 out=$(BORG_PASSPHRASE="$(cat "$BP")" BORG_RELOCATED_REPO_ACCESS_IS_OK=yes borg extract --stdout "$REPO::$arch1" hello.txt)
 echo "$out"
 [ "$out" = "$(cat "$SNAP/hello.txt")" ]; check $? "borg-extracted hello.txt matches original"
@@ -112,11 +114,11 @@ step "keel run #2 (prune keep_daily=1 should leave exactly 1 archive)"
 "$KEEL" run --profile "$PROFILE" --yes
 check $? "run #2 exit code"
 
-list2=$(BORG_PASSPHRASE="$(cat "$BP")" BORG_RELOCATED_REPO_ACCESS_IS_OK=yes borg list --short "$REPO")
+list2=$(BORG_PASSPHRASE="$(cat "$BP")" BORG_RELOCATED_REPO_ACCESS_IS_OK=yes borg list --short "$REPO" 2>/dev/null)
 echo "$list2"
-n2=$(echo "$list2" | wc -l)
-[ "$n2" -eq 1 ]; check $? "exactly 1 archive after prune (keep_daily=1)"
-arch2=$(echo "$list2" | tail -1)
+n2=$(echo "$list2" | grep -c 'live-[0-9]')
+[ "$n2" -eq 1 ]; check $? "exactly 1 archive after prune (keep_daily=1, found $n2)"
+arch2=$(echo "$list2" | grep 'live-[0-9]' | tail -1)
 out2=$(BORG_PASSPHRASE="$(cat "$BP")" BORG_RELOCATED_REPO_ACCESS_IS_OK=yes borg extract --stdout "$REPO::$arch2" hello.txt)
 [ "$out2" = "$(cat "$SNAP/hello.txt")" ]; check $? "retained archive still readable"
 
