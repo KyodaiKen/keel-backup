@@ -16,6 +16,7 @@ mod manifest;
 mod plan;
 mod profile;
 mod tui;
+mod borg;
 
 use std::io::Write as _;
 use std::sync::{Arc, Mutex};
@@ -148,6 +149,15 @@ engines:
   zstd_level: 6
   zstd_threads: null   # null = auto
 
+# methods:      # method settings (sources opt in via `methods: [btrfs, borg]`)
+#   borg:
+#     repo: /mnt/backup/borg-backups        # shared repo on the backup drive
+#     passphrase_file: ~/secrets/borg.bp    # 0400, one line; opens pre-existing repos
+#     compression: zstd,6
+#     keep_daily: 2
+#     keep_weekly: 4
+#     keep_monthly: 12
+
 retention:
   keep: 4              # keep the newest 4 day directories for this host
 "#
@@ -169,7 +179,17 @@ fn cmd_plan(profile_ref: Option<&str>) -> Result<()> {
     println!("day dir    : {}", p.day_dir.display());
     println!();
     for it in &p.items {
-        println!("  {}/{}  ←  {}  [{}]", it.category, it.name, it.source.display(), it.engine);
+        for m in &it.methods {
+            match m.kind {
+                plan::MethodKind::Btrfs => println!("  {}/{}  ←  {}  [btrfs-send]", it.category, it.name, it.source.display()),
+                plan::MethodKind::Borg => {
+                    let repo = prof.methods.borg.as_ref()
+                        .map(|b| b.repo.display().to_string())
+                        .unwrap_or_else(|| "<repo>".into());
+                    println!("  {}  ←  {}  [borg → {}::{}]", it.name, it.source.display(), repo, m.artifact);
+                }
+            }
+        }
     }
     println!("\nRun it with: sudo keel run");
     Ok(())
@@ -241,10 +261,10 @@ fn cmd_run(profile_ref: Option<&str>, dry_run: bool, yes: bool) -> Result<()> {
                     b.set_prefix(format!("{}", engine::human(*written)));
                 }
             }
-            RunEvent::SourceOk { idx, raw, size } => {
+            RunEvent::SourceOk { idx, engine, note } => {
                 if let Some((_, b)) = bars2.iter().find(|(i, _)| i == idx) {
                     b.finish_and_clear();
-                    println!("   ✔ done: {} raw → {} compressed", engine::human(*raw), engine::human(*size));
+                    println!("   ✔ done [{engine}]: {note}");
                 }
             }
             RunEvent::SourceFail { idx, err } => {

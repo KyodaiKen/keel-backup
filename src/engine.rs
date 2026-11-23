@@ -93,8 +93,29 @@ pub struct SentStream {
     pub size_bytes: u64,
 }
 
-pub struct SendConfig<'a> {
-    pub source: &'a Path,
+/// Take a read-only CoW snapshot of a subvolume at the consistent moment
+/// `t`. Returns the snapshot path. Caller owns cleanup via [`SnapGuard`].
+pub fn snapshot(source: &Path) -> Result<PathBuf> {
+    let name = name_for(source);
+    let snap = PathBuf::from(format!("/.keel-{name}-{}", ts_utc()));
+    let so = Command::new("btrfs")
+        .args(["subvolume", "snapshot", "-r"])
+        .arg(source)
+        .arg(&snap)
+        .output()
+        .context("failed to spawn `btrfs subvolume snapshot`")?;
+    if !so.status.success() {
+        let err = String::from_utf8_lossy(&so.stderr);
+        bail!("snapshot of {} failed: {}", source.display(), err.trim());
+    }
+    Ok(snap)
+}
+
+pub struct SendStreamConfig<'a> {
+    /// Display/manifest name for this source (e.g. `home`).
+    pub name: &'a str,
+    /// Snapshot to send (created with [`snapshot`]).
+    pub snapshot: &'a Path,
     pub out: &'a Path,
     pub zstd_level: u8,
     /// `None` → `-T0` (auto).
@@ -103,26 +124,12 @@ pub struct SendConfig<'a> {
     pub on_progress: &'a dyn Fn(u64, u64),
 }
 
-/// Snapshot + send + compress one subvolume. Returns the stream stats.
-/// Snapshots are cleaned on any path (guard); on success the anchor snapshot
-/// is deleted because the stream is self-contained.
-pub fn send(cfg: &SendConfig) -> Result<SentStream> {
-    let name = name_for(cfg.source);
-    let snap = PathBuf::from(format!("/.keel-{name}-{}", ts_utc()));
-    let mut guard = SnapGuard::new();
-
-    // 1) CoW snapshot (consistent moment).
-    let so = Command::new("btrfs")
-        .args(["subvolume", "snapshot", "-r"])
-        .arg(cfg.source)
-        .arg(&snap)
-        .output()
-        .context("failed to spawn `btrfs subvolume snapshot`")?;
-    if !so.status.success() {
-        let err = String::from_utf8_lossy(&so.stderr);
-        bail!("snapshot of {} failed: {}", cfg.source.display(), err.trim());
-    }
-    guard.add(snap.clone());
+/// `btrfs send <snapshot> | zstd` → stream file. No snapshot management:
+/// the caller keeps the anchor snapshot alive for as long as it wants (e.g.
+/// while a borg archive of the same snapshot runs) and deletes it afterwards.
+pub fn send_stream(cfg: &SendStreamConfig) -> Result<SentStream> {
+    let name = cfg.name.to_string();
+    let snap = cfg.snapshot.to_path_buf();
 
     // 2) Compressor: zstd reads stdin, writes the output file.
     let mut zargs: Vec<String> = Vec::new();
@@ -195,7 +202,7 @@ pub fn send(cfg: &SendConfig) -> Result<SentStream> {
     let raw_total = raw.load(Ordering::Relaxed);
 
     if pump_res.is_err() {
-        bail!("pipe pump thread panicked while sending {}", cfg.source.display());
+        bail!("pipe pump thread panicked while sending {}", snap.display());
     }
     if !s_status.success() {
         let _ = std::fs::remove_file(cfg.out);
@@ -210,9 +217,6 @@ pub fn send(cfg: &SendConfig) -> Result<SentStream> {
         let _ = std::fs::remove_file(cfg.out);
         bail!("zstd compression failed: {}", z_err.trim());
     }
-
-    // Success: the stream is self-contained → drop the anchor snapshot now.
-    guard.consume();
 
     let size = std::fs::metadata(cfg.out).map(|m| m.len()).unwrap_or(0);
     Ok(SentStream {

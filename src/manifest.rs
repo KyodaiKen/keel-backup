@@ -14,6 +14,37 @@ use crate::engine;
 use crate::plan::Plan;
 use crate::profile::Profile;
 
+/// One method result for a source (btrfs stream or borg archive).
+#[derive(Debug, Clone, Serialize)]
+pub struct MethodEntry {
+    /// Engine used: `btrfs-send` or `borg`.
+    pub engine: String,
+    /// Whether this method succeeded.
+    pub ok: bool,
+    /// Error text when `ok` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Snapshot the method read from (shared across the source's methods).
+    pub snapshot: String,
+    // --- btrfs-send ------------------------------------------------------
+    /// Stream file, relative to the day dir (e.g. `os/rootfs.zst`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_rel: Option<String>,
+    /// Raw bytes streamed by the engine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_bytes: Option<u64>,
+    /// Compressed file size in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    // --- borg ------------------------------------------------------------
+    /// Archive name (e.g. `feline-home-2026-11-23-21-58-00`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive: Option<String>,
+    /// Repo the archive lives in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+}
+
 /// One backed-up source.
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceEntry {
@@ -23,16 +54,8 @@ pub struct SourceEntry {
     pub source: String,
     /// Category: `os` | `home` | `extra` (day-dir subdirectory).
     pub category: String,
-    /// Engine used (e.g. `btrfs-send`).
-    pub engine: String,
-    /// Snapshot the stream was created from.
-    pub snapshot: String,
-    /// Stream file, relative to the day dir (e.g. `os/rootfs.zst`).
-    pub stream_rel: String,
-    /// Raw bytes streamed by the engine.
-    pub raw_bytes: u64,
-    /// Compressed file size in bytes.
-    pub size_bytes: u64,
+    /// Per-method results, in run order.
+    pub methods: Vec<MethodEntry>,
 }
 
 /// The full receipt for one run.
@@ -52,19 +75,19 @@ pub struct RunManifest {
     pub destination: String,
     /// Day directory (absolute).
     pub day_dir: String,
-    /// True when every listed source succeeded.
+    /// True when every method of every source succeeded.
     pub complete: bool,
     /// Backed-up sources.
     pub entries: Vec<SourceEntry>,
-    /// Phase 0 restore hint (generic; the generated live-media restore
-    /// script arrives in Phase 1).
+    /// Restore hints (one per engine family present).
     pub restore_hint: String,
 }
 
 impl RunManifest {
     pub fn new(plan: &Plan, _profile: &Profile) -> Self {
+        let has_borg = plan.items.iter().any(|i| i.methods.iter().any(|m| m.kind == crate::plan::MethodKind::Borg));
         Self {
-            format: "keel/1".into(),
+            format: "keel/2".into(),
             host: hostname(),
             completed_utc: engine::ts_utc(),
             profile: plan.profile_path.display().to_string(),
@@ -73,7 +96,11 @@ impl RunManifest {
             day_dir: plan.day_dir.display().to_string(),
             complete: false,
             entries: Vec::new(),
-            restore_hint: "btrfs send/receive streams: `zstd -d < day/.../os/rootfs.zst | btrfs receive -p /target` (Phase 1 ships a generated live-media restore script)".into(),
+            restore_hint: if has_borg {
+                "btrfs streams: `zstd -d < day/.../os/rootfs.zst | btrfs receive -p /target`; borg archives: `borg extract <repo>::<archive> /target` (file-level) or `borg mount` (Phase 1 ships a generated live-media restore script)".into()
+            } else {
+                "btrfs send/receive streams: `zstd -d < day/.../os/rootfs.zst | btrfs receive -p /target` (Phase 1 ships a generated live-media restore script)".into()
+            },
         }
     }
 

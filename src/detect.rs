@@ -218,15 +218,15 @@ pub fn registry() -> Vec<Capability> {
 
     caps.push(Capability {
         id: "borg",
-        title: "borg — deduplicated redundant copy".into(),
+        title: "borg — deduplicated, incremental archives".into(),
         applicable: borg_bin.is_some(),
         reason: if borg_bin.is_some() {
-            "passphrase comes from the profile env_file (never hardcoded)".into()
+            "repo + passphrase file configured per profile (methods.borg); passphrase is never hardcoded".into()
         } else {
             "borg binary missing".into()
         },
         evidence: vec![format!("borg = {:?}", borg_bin)],
-        implemented: false,
+        implemented: true,
     });
 
     caps.push(Capability {

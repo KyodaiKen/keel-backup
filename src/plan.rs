@@ -3,14 +3,19 @@
 //! Shared by the CLI (`keel run`) and the TUI (`keel`). Side effects only
 //! happen after the destination is write-verified. `dry_run` verifies
 //! everything (destination, plan, root) but writes no streams.
+//!
+//! Multi-method: each source declares its methods (e.g. `[btrfs, borg]`).
+//! One consistent snapshot is taken per source and every method reads from
+//! that same moment — the snapshot is deleted only after the last method has
+//! finished (success or failure), per-source failures are isolated.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 
-use crate::detect::{euid, free_bytes, hostname, parse_size};
-use crate::engine::{self};
+use crate::detect::{euid, free_bytes, hostname, parse_size, which};
+use crate::engine::{self, SnapGuard};
 use crate::profile::{Destination, DestinationCandidate, Profile};
 
 /// Events emitted by the pipeline (CLI prints + bars, TUI renders).
@@ -22,18 +27,18 @@ pub enum RunEvent {
     Destination(String),
     /// Day directory in use.
     DayDir(String),
-    /// One source is starting.
+    /// One source/method is starting.
     SourceStart {
         idx: usize,
         label: String,
         engine: String,
         out_rel: String,
     },
-    /// Progress for a source: raw bytes streamed, compressed bytes written.
+    /// Progress for a stream method: raw bytes streamed, compressed written.
     Progress { idx: usize, raw: u64, written: u64 },
-    /// One source finished OK.
-    SourceOk { idx: usize, raw: u64, size: u64 },
-    /// One source failed.
+    /// One method finished OK.
+    SourceOk { idx: usize, engine: String, note: String },
+    /// One source/method failed.
     SourceFail { idx: usize, err: String },
     /// Manifest file written.
     Manifest(String),
@@ -53,15 +58,28 @@ pub fn emit(ev: &EventArc, e: &RunEvent) {
     }
 }
 
+/// One method for one source.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MethodKind {
+    Btrfs,
+    Borg,
+}
+
+#[derive(Debug, Clone)]
+pub struct Method {
+    pub kind: MethodKind,
+    /// btrfs: stream path relative to the day dir (`os/rootfs.zst`);
+    /// borg: the archive name (no `::`).
+    pub artifact: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct PlanItem {
     pub idx: usize,
     pub name: String,
     pub source: PathBuf,
     pub category: String,
-    pub engine: String,
-    /// Relative to the day dir, e.g. `os/rootfs.zst`.
-    pub stream_rel: String,
+    pub methods: Vec<Method>,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +117,9 @@ pub fn build_plan(profile_path: &Path, profile: &Profile) -> Result<Plan> {
         .join(&date)
         .join(&host);
 
+    let borg_cfg = profile.methods.borg.as_ref();
+    let borg_bin = which("borg");
+
     let mut items = Vec::new();
     for (i, src) in profile.sources.iter().enumerate() {
         if !src.path.is_absolute() {
@@ -110,25 +131,78 @@ pub fn build_plan(profile_path: &Path, profile: &Profile) -> Result<Plan> {
         let fs = crate::detect::fs_type(&src.path).unwrap_or_default();
         if fs != "btrfs" {
             bail!(
-                "source {} is on '{}' — Phase 0 only handles btrfs subvolumes \
-                 (tar+zstd / squashfs engines land in Phase 1)",
+                "source {} is on '{}' — keel currently needs btrfs subvolumes \
+                 (snapshot-based consistency for every method)",
                 src.path.display(),
                 fs
             );
         }
+
+        // Resolve this source's methods.
+        let kind_list: Vec<MethodKind> = match &src.methods {
+            None => vec![MethodKind::Btrfs],
+            Some(names) => {
+                if names.is_empty() {
+                    bail!(
+                        "source {} lists `methods: []` — nothing would back it up",
+                        src.path.display()
+                    );
+                }
+                names
+                    .iter()
+                    .map(|n| match n.trim() {
+                        "btrfs" | "btrfs-send" => Ok(MethodKind::Btrfs),
+                        "borg" => Ok(MethodKind::Borg),
+                        other => bail!(
+                            "source {} lists unknown method {other:?} (valid: btrfs, borg)",
+                            src.path.display()
+                        ),
+                    })
+                    .collect::<Result<_>>()?
+            }
+        };
+
+        if kind_list.contains(&MethodKind::Borg) {
+            let bc = match borg_cfg.as_ref() {
+                Some(bc) => bc,
+                None => bail!(
+                    "source {} uses method `borg` but the profile has no `methods.borg` block \
+                     (repo + passphrase_file are required)",
+                    src.path.display()
+                ),
+            };
+            if borg_bin.is_none() {
+                bail!("source {} uses method `borg` but no `borg` binary was found on PATH", src.path.display());
+            }
+            let _ = bc; // settings validated at run time
+        }
+
         let name = src.name.clone().unwrap_or_else(|| engine::name_for(&src.path));
-        let stream_rel = format!("{}/{}.zst", src.category, name);
+        let category = if src.category.is_empty() {
+            "extra".into()
+        } else {
+            src.category.clone()
+        };
+        let methods: Vec<Method> = kind_list
+            .iter()
+            .map(|k| match k {
+                MethodKind::Btrfs => Method {
+                    kind: MethodKind::Btrfs,
+                    artifact: format!("{category}/{name}.zst"),
+                },
+                MethodKind::Borg => Method {
+                    kind: MethodKind::Borg,
+                    artifact: crate::borg::archive_name(&name),
+                },
+            })
+            .collect();
+
         items.push(PlanItem {
             idx: i,
             name,
             source: src.path.clone(),
-            category: if src.category.is_empty() {
-                "extra".into()
-            } else {
-                src.category.clone()
-            },
-            engine: "btrfs-send".into(),
-            stream_rel,
+            category,
+            methods,
         });
     }
 
@@ -171,9 +245,8 @@ fn describe_destination(d: &Destination) -> String {
 pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Result<()> {
     if euid() != 0 {
         bail!(
-            "keel needs root (snapshots, mounting, umount) — re-run as: sudo keel run{}{}",
-            if dry_run { " --dry-run" } else { "" },
-            ""
+            "keel needs root (snapshots, mounting, umount) — re-run as: sudo keel run{}",
+            if dry_run { " --dry-run" } else { "" }
         );
     }
 
@@ -240,15 +313,17 @@ pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Resu
     if dry_run {
         emit(ev, &RunEvent::DayDir(plan.day_dir.display().to_string()));
         for it in &plan.items {
-            emit(
-                ev,
-                &RunEvent::SourceStart {
-                    idx: it.idx,
-                    label: it.source.display().to_string(),
-                    engine: it.engine.clone(),
-                    out_rel: it.stream_rel.clone(),
-                },
-            );
+            for m in &it.methods {
+                emit(
+                    ev,
+                    &RunEvent::SourceStart {
+                        idx: it.idx,
+                        label: format!("{} [{}]", it.source.display(), describe_method(m, profile)),
+                        engine: engine_label(m.kind),
+                        out_rel: m.artifact.clone(),
+                    },
+                );
+            }
         }
         emit(ev, &RunEvent::Note(format!(
             "dry run: {} source(s) planned — nothing written",
@@ -270,65 +345,249 @@ pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Resu
     // ---- sources --------------------------------------------------------
     let mut manifest = crate::manifest::RunManifest::new(plan, profile);
     let mut any_fail = false;
+    let mut any_borg_ok = false;
+    let mut borg_pass = String::new();
+    let mut borg_bootstrapped = false;
+
     for it in &plan.items {
-        let out = day.join(&it.stream_rel);
-        if let Some(parent) = out.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        emit(
-            ev,
-            &RunEvent::SourceStart {
-                idx: it.idx,
-                label: it.source.display().to_string(),
-                engine: it.engine.clone(),
-                out_rel: it.stream_rel.clone(),
-            },
-        );
-
-        let out_c = out.clone();
-        let res = (|| -> anyhow::Result<engine::SentStream> {
-            engine::send(&engine::SendConfig {
-                source: &it.source,
-                out: &out_c,
-                zstd_level: profile.engines.zstd_level,
-                zstd_threads: profile.engines.zstd_threads,
-                on_progress: &|raw, written| {
-                    emit(ev, &RunEvent::Progress { idx: it.idx, raw, written });
-                },
-            })
-        })();
-
-        match res {
-            Ok(s) => {
-                manifest.entries.push(crate::manifest::SourceEntry {
-                    name: s.name.clone(),
-                    source: it.source.display().to_string(),
-                    category: it.category.clone(),
-                    engine: it.engine.clone(),
-                    snapshot: s.snapshot.display().to_string(),
-                    stream_rel: it.stream_rel.clone(),
-                    raw_bytes: s.raw_bytes,
-                    size_bytes: s.size_bytes,
-                });
-                emit(
-                    ev,
-                    &RunEvent::SourceOk { idx: it.idx, raw: s.raw_bytes, size: s.size_bytes },
-                );
-            }
+        // One consistent moment for the whole source, shared by all methods.
+        let snap_res = engine::snapshot(&it.source);
+        let snap = match snap_res {
+            Ok(s) => s,
             Err(e) => {
                 any_fail = true;
-                emit(ev, &RunEvent::SourceFail { idx: it.idx, err: format!("{e:#}") });
+                let fail_entries: Vec<crate::manifest::MethodEntry> = it.methods.iter().map(|m| crate::manifest::MethodEntry {
+                    engine: engine_label(m.kind),
+                    ok: false,
+                    error: Some(format!("snapshot: {e:#}")),
+                    snapshot: String::new(),
+                    stream_rel: None,
+                    raw_bytes: None,
+                    size_bytes: None,
+                    archive: None,
+                    repo: None,
+                }).collect();
+                manifest.entries.push(crate::manifest::SourceEntry {
+                    name: it.name.clone(),
+                    source: it.source.display().to_string(),
+                    category: it.category.clone(),
+                    methods: fail_entries,
+                });
+                emit(ev, &RunEvent::SourceFail { idx: it.idx, err: format!("snapshot: {e:#}") });
+                continue;
+            }
+        };
+        let mut guard = SnapGuard::new();
+        guard.add(snap.clone());
+
+        let src = profile.sources.iter().find(|s| s.path == it.source)
+            .expect("plan item source must exist in profile");
+        let mut m_entries: Vec<crate::manifest::MethodEntry> = Vec::new();
+
+        for m in &it.methods {
+            match m.kind {
+                MethodKind::Btrfs => {
+                    let out = day.join(&m.artifact);
+                    if let Some(parent) = out.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    emit(
+                        ev,
+                        &RunEvent::SourceStart {
+                            idx: it.idx,
+                            label: it.source.display().to_string(),
+                            engine: "btrfs-send".into(),
+                            out_rel: m.artifact.clone(),
+                        },
+                    );
+                    let name = it.name.clone();
+                    let out_c = out.clone();
+                    let res = (|| -> anyhow::Result<engine::SentStream> {
+                        engine::send_stream(&engine::SendStreamConfig {
+                            name: &name,
+                            snapshot: &snap,
+                            out: &out_c,
+                            zstd_level: profile.engines.zstd_level,
+                            zstd_threads: profile.engines.zstd_threads,
+                            on_progress: &|raw, written| {
+                                emit(ev, &RunEvent::Progress { idx: it.idx, raw, written });
+                            },
+                        })
+                    })();
+                    match res {
+                        Ok(s) => {
+                            m_entries.push(crate::manifest::MethodEntry {
+                                engine: "btrfs-send".into(),
+                                ok: true,
+                                error: None,
+                                snapshot: s.snapshot.display().to_string(),
+                                stream_rel: Some(m.artifact.clone()),
+                                raw_bytes: Some(s.raw_bytes),
+                                size_bytes: Some(s.size_bytes),
+                                archive: None,
+                                repo: None,
+                            });
+                            emit(
+                                ev,
+                                &RunEvent::SourceOk {
+                                    idx: it.idx,
+                                    engine: "btrfs-send".into(),
+                                    note: format!(
+                                        "{} raw → {} compressed ({})",
+                                        engine::human(s.raw_bytes),
+                                        engine::human(s.size_bytes),
+                                        m.artifact
+                                    ),
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            any_fail = true;
+                            m_entries.push(crate::manifest::MethodEntry {
+                                engine: "btrfs-send".into(),
+                                ok: false,
+                                error: Some(format!("{e:#}")),
+                                snapshot: snap.display().to_string(),
+                                stream_rel: Some(m.artifact.clone()),
+                                raw_bytes: None,
+                                size_bytes: None,
+                                archive: None,
+                                repo: None,
+                            });
+                            emit(ev, &RunEvent::SourceFail { idx: it.idx, err: format!("{e:#}") });
+                        }
+                    }
+                }
+                MethodKind::Borg => {
+                    let bc = profile.methods.borg.as_ref().expect("validated in build_plan");
+                    emit(
+                        ev,
+                        &RunEvent::SourceStart {
+                            idx: it.idx,
+                            label: it.source.display().to_string(),
+                            engine: "borg".into(),
+                            out_rel: format!("{}::{}", bc.repo.display(), m.artifact),
+                        },
+                    );
+                    let cfg = crate::borg::BorgCreateConfig {
+                        repo: bc.repo.clone(),
+                        passphrase_file: bc.passphrase_file.clone(),
+                        snapshot: snap.clone(),
+                        archive: m.artifact.clone(),
+                        compression: bc.compression.clone(),
+                        excludes: src.excludes.clone(),
+                    };
+                    match crate::borg::create(&cfg) {
+                        Ok((pass, bootstrapped)) => {
+                            any_borg_ok = true;
+                            borg_pass = pass;
+                            if bootstrapped {
+                                borg_bootstrapped = true;
+                                emit(
+                                    ev,
+                                    &RunEvent::Note(format!(
+                                        "⚠ NEW borg passphrase generated at {} (0400) — it is the \
+                                         only key to this repo alongside the drive; store it safely",
+                                        bc.passphrase_file.display()
+                                    )),
+                                );
+                            }
+                            m_entries.push(crate::manifest::MethodEntry {
+                                engine: "borg".into(),
+                                ok: true,
+                                error: None,
+                                snapshot: snap.display().to_string(),
+                                stream_rel: None,
+                                raw_bytes: None,
+                                size_bytes: None,
+                                archive: Some(m.artifact.clone()),
+                                repo: Some(bc.repo.display().to_string()),
+                            });
+                            emit(
+                                ev,
+                                &RunEvent::SourceOk {
+                                    idx: it.idx,
+                                    engine: "borg".into(),
+                                    note: format!("archive {} in {}", m.artifact, bc.repo.display()),
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            any_fail = true;
+                            m_entries.push(crate::manifest::MethodEntry {
+                                engine: "borg".into(),
+                                ok: false,
+                                error: Some(format!("{e:#}")),
+                                snapshot: snap.display().to_string(),
+                                stream_rel: None,
+                                raw_bytes: None,
+                                size_bytes: None,
+                                archive: Some(m.artifact.clone()),
+                                repo: Some(bc.repo.display().to_string()),
+                            });
+                            emit(ev, &RunEvent::SourceFail { idx: it.idx, err: format!("{e:#}") });
+                        }
+                    }
+                }
             }
         }
+
+        // All methods for this source are done (ok or failed): release the
+        // shared anchor snapshot now (or the guard's Drop will on panic).
+        guard.consume();
+        drop(guard);
+
+        manifest.entries.push(crate::manifest::SourceEntry {
+            name: it.name.clone(),
+            source: it.source.display().to_string(),
+            category: it.category.clone(),
+            methods: m_entries,
+        });
     }
 
     // ---- manifest ---------------------------------------------------------
     let mf = day.join("manifest.yaml");
-    manifest.complete = !any_fail && !manifest.entries.is_empty();
+    let all_ok = !manifest.entries.is_empty()
+        && manifest
+            .entries
+            .iter()
+            .flat_map(|e| e.methods.iter())
+            .all(|m| m.ok);
+    manifest.complete = all_ok && !any_fail;
     manifest.write(&mf)?;
     emit(ev, &RunEvent::Manifest(mf.display().to_string()));
 
-    // ---- retention ---------------------------------------------------------
+    // ---- borg retention (whole shared repo, once per run) ----------------
+    if any_borg_ok {
+        if let Some(bc) = &profile.methods.borg {
+            match crate::borg::prune(
+                &bc.repo,
+                bc.keep_daily,
+                bc.keep_weekly,
+                bc.keep_monthly,
+                &borg_pass,
+            ) {
+                Ok(()) => emit(
+                    ev,
+                    &RunEvent::Retained(format!(
+                        "borg prune applied to {}: keep daily {}/weekly {}/monthly {}",
+                        bc.repo.display(),
+                        bc.keep_daily,
+                        bc.keep_weekly,
+                        bc.keep_monthly
+                    )),
+                ),
+                Err(e) => emit(
+                    ev,
+                    &RunEvent::Note(format!(
+                        "⚠ borg prune FAILED (archives kept, retention NOT applied): {e:#}"
+                    )),
+                ),
+            }
+        }
+    }
+
+    // ---- streams retention -------------------------------------------------
     if let Some(keep) = profile.retention.keep {
         if let Some(msg) = prune_old(plan, keep) {
             emit(ev, &RunEvent::Retained(msg));
@@ -341,12 +600,37 @@ pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Resu
         emit(ev, &RunEvent::Note(format!("unmounted {}", mp.display())));
     }
 
+    if borg_bootstrapped {
+        // Re-emit the safety notice at the end, where it is most visible.
+        emit(ev, &RunEvent::Note("⚠ this run generated a NEW borg passphrase — see the notice above; the old one (if any) no longer exists".to_string()));
+    }
+
     emit(ev, &RunEvent::Done);
 
     if any_fail {
-        bail!("one or more sources failed — see log (manifest marked incomplete)");
+        bail!("one or more methods failed — see log (manifest marked incomplete)");
     }
     Ok(())
+}
+
+fn engine_label(k: MethodKind) -> String {
+    match k {
+        MethodKind::Btrfs => "btrfs-send".into(),
+        MethodKind::Borg => "borg".into(),
+    }
+}
+
+fn describe_method(m: &Method, profile: &Profile) -> String {
+    match m.kind {
+        MethodKind::Btrfs => "stream".into(),
+        MethodKind::Borg => {
+            if let Some(bc) = &profile.methods.borg {
+                format!("borg {}", bc.repo.display())
+            } else {
+                "borg".into()
+            }
+        }
+    }
 }
 
 fn expand_home(p: &Path) -> PathBuf {

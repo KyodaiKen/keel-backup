@@ -146,10 +146,10 @@ fn apply_event(st: &mut State, e: &RunEvent) {
                 *v = (*raw, *written);
             }
         }
-        RunEvent::SourceOk { idx, raw, size } => {
+        RunEvent::SourceOk { idx, engine, note } => {
             st.bars.remove(idx);
             st.events.push(Line::styled(
-                format!("   ✔ done: {} raw → {} compressed", human(*raw), human(*size)),
+                format!("   ✔ done [{engine}]: {note}"),
                 Style::default().fg(Color::Green),
             ));
         }
@@ -378,8 +378,14 @@ fn render_plan(f: &mut Frame, st: &State, area: ratatui::layout::Rect) {
                 lines.push(Line::from(vec![
                     Span::styled(format!("   {} → ", it.category), Style::default().fg(Color::Yellow)),
                     Span::styled(format!("{}", it.source.display()), Style::default().add_modifier(Modifier::BOLD)),
-                    Span::styled(format!("  →  {}/{}.zst   [{}]", it.category, it.name, it.engine), Style::default().fg(Color::Green)),
                 ]));
+                for m in &it.methods {
+                    let label = match m.kind {
+                        crate::plan::MethodKind::Btrfs => format!("  →  {}/{}.zst   [btrfs-send]", it.category, it.name),
+                        crate::plan::MethodKind::Borg => format!("  →  <repo>::{}   [borg]", m.artifact),
+                    };
+                    lines.push(Line::styled(label, Style::default().fg(Color::Green)));
+                }
             }
             lines.push(Line::from(Span::raw("   ")));
             lines.push(Line::styled(
