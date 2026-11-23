@@ -1,0 +1,21 @@
+[package]
+name = "keel"
+version = "0.0.1"
+edition = "2021"
+description = "keel — profile-driven, distribution-agnostic, bare-metal-capable system backups"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+indicatif = "0.17"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
