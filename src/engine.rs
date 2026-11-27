@@ -363,14 +363,33 @@ pub fn tar_stream(cfg: &TarStreamConfig) -> Result<SentStream> {
 
 /// Run `bin` as-is, or (when `run_as` is set) wrap it in
 /// `runuser -u <user> -- bin` — keel itself runs as root.
+/// How to exec `bin` when the profile asks for `run_as`.
+///
+/// Prefer `machinectl shell <user>@ -- <abs-path>`: it starts a real PAM
+/// session inside the target user's own systemd user slice. Rootless
+/// container engines (podman) must manage their own cgroup/user namespaces
+/// at startup — and they refuse to do that from a root-owned session
+/// cgroup (`runuser` keeps the caller's cgroup, so rootless podman dies with
+/// "error opening namespace handles: Permission denied"; verified on
+/// FELINE, 2026-11-27). machinectl also demands an absolute binary path, so
+/// we resolve it; if machinectl or the binary is unresolvable we fall back
+/// to plain `runuser` (fine for tools that don't need their own cgroup).
 fn as_user(bin: &str, run_as: Option<&str>) -> (String, Vec<String>) {
-    match run_as {
-        Some(u) => (
-            "runuser".to_string(),
-            vec!["-u".into(), u.to_string(), "--".into(), bin.to_string()],
-        ),
-        None => (bin.to_string(), Vec::new()),
+    let Some(u) = run_as else {
+        return (bin.to_string(), Vec::new());
+    };
+    if let (Some(mach), Some(abspath)) =
+        (crate::detect::which("machinectl"), crate::detect::which(bin))
+    {
+        return (
+            mach,
+            vec!["shell".into(), format!("{u}@"), "--".into(), abspath],
+        );
     }
+    (
+        "runuser".to_string(),
+        vec!["-u".into(), u.to_string(), "--".into(), bin.to_string()],
+    )
 }
 
 /// Expand exclude patterns for mksquashfs (squashfs-tools 4.7.4 semantics,
@@ -796,5 +815,39 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn as_user_no_run_as_is_plain() {
+        let (bin, args) = as_user("podman", None);
+        assert_eq!(bin, "podman");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn as_user_run_as_prefers_user_session() {
+        let (bin, args) = as_user("podman", Some("kyo"));
+        if crate::detect::which("machinectl").is_some()
+            && crate::detect::which("podman").is_some()
+        {
+            // machinectl demands an absolute binary path and shells into the
+            // target user's own session (their slice/cgroup).
+            assert_eq!(
+                bin,
+                crate::detect::which("machinectl").unwrap()
+            );
+            assert_eq!(
+                args,
+                vec![
+                    "shell".to_string(),
+                    "kyo@".to_string(),
+                    "--".to_string(),
+                    crate::detect::which("podman").unwrap(),
+                ]
+            );
+        } else {
+            assert_eq!(bin, "runuser");
+            assert!(args.contains(&"kyo".to_string()));
+        }
     }
 }

@@ -32,7 +32,7 @@ system.
     bootstrap or hard refusal (never invents one), prune, `excludes`
 - Sources beyond trees (each one self-contained, root-free where possible):
   - **pg_dump** — `pg_dump -Fc` custom-format dumps (optionally as another user via `run_as`)
-  - **podman_save** — save container images; optional `podman commit` of a live container first
+  - **podman_save** — save container images; optional `podman commit` of a live container first; use `run_as: <user>` when images live in a rootless store (keel launches podman inside that user's session via machinectl)
   - **systemd_state** — `systemctl list-unit-files` captured to YAML for bare-metal restore
 - A source can use several engines — `methods: [btrfs, borg]` gives both a
   fast stream and a deduplicated copy from the *same* consistent snapshot
