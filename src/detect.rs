@@ -76,6 +76,20 @@ pub fn which(bin: &str) -> Option<String> {
     None
 }
 
+/// The uid/gid of a user from /etc/passwd (Linux).
+pub fn user_ids(user: &str) -> Option<(u32, u32)> {
+    let pw = std::fs::read_to_string("/etc/passwd").ok()?;
+    for line in pw.lines() {
+        let f: Vec<&str> = line.split(':').collect();
+        if f.len() >= 5 && f[0] == user {
+            let uid: u32 = f[2].parse().ok()?;
+            let gid: u32 = f[3].parse().ok()?;
+            return Some((uid, gid));
+        }
+    }
+    None
+}
+
 /// The effective UID (from /proc/self/status; Linux).
 pub fn euid() -> u32 {
     let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
@@ -359,5 +373,11 @@ mod tests {
     fn fs_type_root() {
         assert!(fs_type(Path::new("/")).is_some());
         assert!(fs_type(Path::new("/definitely/not/mounted")).is_some());
+    }
+
+    #[test]
+    fn user_ids_lookup() {
+        assert_eq!(user_ids("root"), Some((0, 0)));
+        assert_eq!(user_ids("definitely_not_a_user_xyz"), None);
     }
 }

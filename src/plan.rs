@@ -380,6 +380,20 @@ fn describe_destination(d: &Destination) -> String {
 }
 
 /// Run the whole pipeline. `ev` receives events as they happen.
+/// keel runs as root, but `run_as` engines exec as the target user and must
+/// be able to create their artifact file. A root `create_dir_all` leaves the
+/// dir root-owned 0755, so the user process can't write into it — and the
+/// failure can be masked (machinectl shell exits 0 even when the inner
+/// command fails), surfacing only as an empty/missing archive. Chown the
+/// artifact dir to the user; on unknown user or failure the engine's own
+/// error will surface instead. (Verified on FELINE, 2026-11-27.)
+fn chown_dir_for_user(path: &Path, user: &str) {
+    use std::os::unix::fs::chown;
+    if let Some((uid, gid)) = crate::detect::user_ids(user) {
+        let _ = chown(path, Some(uid), Some(gid));
+    }
+}
+
 pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Result<()> {
     if euid() != 0 {
         bail!(
@@ -848,6 +862,9 @@ pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Resu
                     let out = day.join(&m.artifact);
                     if let Some(parent) = out.parent() {
                         std::fs::create_dir_all(parent)?;
+                        if let Some(u) = run_as.as_deref() {
+                            chown_dir_for_user(parent, u);
+                        }
                     }
                     emit(
                         ev,
@@ -927,6 +944,9 @@ pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Resu
                     let out = day.join(&m.artifact);
                     if let Some(parent) = out.parent() {
                         std::fs::create_dir_all(parent)?;
+                        if let Some(u) = run_as.as_deref() {
+                            chown_dir_for_user(parent, u);
+                        }
                     }
                     emit(
                         ev,

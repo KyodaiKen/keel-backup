@@ -638,7 +638,10 @@ pub fn podman_save(cfg: &PodmanSaveConfig) -> Result<u64> {
     let size = std::fs::metadata(cfg.out).map(|m| m.len()).unwrap_or(0);
     if size == 0 {
         let _ = std::fs::remove_file(cfg.out);
-        bail!("podman save produced an empty archive");
+        bail!(
+            "podman save wrote no data to {} (image missing in that user's store, or the user cannot create files in the destination dir)",
+            cfg.out.display()
+        );
     }
     Ok(size)
 }
