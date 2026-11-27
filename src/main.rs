@@ -115,7 +115,7 @@ fn cmd_suggest() -> Result<()> {
             srcs.push_str(&format!("  - path: {s}\n    category: {cat}\n    name: {name}\n"));
         }
     } else {
-        srcs.push_str("  # No btrfs subvolumes detected — Phase 1 engines (tar+zstd, squashfs)\n  # will cover ext4/xfs trees once they land.\n");
+        srcs.push_str("  # No btrfs subvolumes detected — non-btrfs trees are backed up with\n  # methods: [tar] (whole-tree tar+zstd) and/or [borg].\n  # e.g.  - path: /boot\n  #        category: boot\n  #        methods: [tar]\n");
     }
 
     let yaml = format!(
@@ -144,12 +144,17 @@ destination:
   min_free: 50G
 
 sources:
+  # Per-source extras (all optional):
+  #   name: home                  # manifest label (defaults to the path name)
+  #   category: home              # day-dir subdirectory (os/home/boot/…)
+  #   methods: [btrfs, borg]      # default: btrfs on subvolumes, tar elsewhere
+  #   excludes: ["ollama-models/blobs"]   # tar globs / borg patterns; btrfs streams are whole-subvolume
 {srcs}
 engines:
   zstd_level: 6
   zstd_threads: null   # null = auto
 
-# methods:      # method settings (sources opt in via `methods: [btrfs, borg]`)
+# methods:      # method settings (sources opt in via `methods: [btrfs, borg, tar]`)
 #   borg:
 #     repo: /mnt/backup/borg-backups        # shared repo on the backup drive
 #     passphrase_file: ~/secrets/borg.bp    # 0400, one line; opens pre-existing repos
@@ -166,7 +171,7 @@ retention:
     if matches!(root_fs.as_deref(), Some("btrfs")) {
         eprintln!("\n# detected btrfs on / — sources pre-filled ({subs} nested subvolume(s))", subs = subs.len());
     } else {
-        eprintln!("\n# no btrfs detected on / ({root_fs:?}) — Phase 1 engines will cover other filesystems");
+        eprintln!("\n# no btrfs detected on / ({root_fs:?}) — use methods: [tar] for those trees");
     }
     Ok(())
 }
@@ -182,6 +187,7 @@ fn cmd_plan(profile_ref: Option<&str>) -> Result<()> {
         for m in &it.methods {
             match m.kind {
                 plan::MethodKind::Btrfs => println!("  {}/{}  ←  {}  [btrfs-send]", it.category, it.name, it.source.display()),
+                plan::MethodKind::Tar => println!("  {}/{}  ←  {}  [tar+zstd]", it.category, it.name, it.source.display()),
                 plan::MethodKind::Borg => {
                     let repo = prof.methods.borg.as_ref()
                         .map(|b| b.repo.display().to_string())

@@ -228,6 +228,138 @@ pub fn send_stream(cfg: &SendStreamConfig) -> Result<SentStream> {
     })
 }
 
+pub struct TarStreamConfig<'a> {
+    /// Display/manifest name for this source (e.g. `boot`).
+    pub name: &'a str,
+    /// Directory whose *contents* are archived (the tree root).
+    pub src: &'a Path,
+    /// Exclude globs relative to the tree root (tar-style, unanchored),
+    /// e.g. `blobs` skips `blobs/` wherever it appears under the root.
+    pub excludes: &'a [String],
+    pub out: &'a Path,
+    pub zstd_level: u8,
+    /// `None` → `-T0` (auto).
+    pub zstd_threads: Option<usize>,
+    /// raw_bytes, compressed_so_far
+    pub on_progress: &'a dyn Fn(u64, u64),
+}
+
+/// `tar -c --exclude=… -C <src> . | zstd` → stream file.
+///
+/// Archive paths are relative to the tree root (`./a/b.txt`), so extracting
+/// into any directory reproduces the tree. Excludes are applied by tar
+/// itself — excluded files are never read or stored. Works on any filesystem
+/// (the point of this engine); when the source is a btrfs subvolume the
+/// caller should point `src` at the CoW snapshot for consistency.
+pub fn tar_stream(cfg: &TarStreamConfig) -> Result<SentStream> {
+    let name = cfg.name.to_string();
+
+    // Compressor: zstd reads stdin, writes the output file.
+    let mut zargs: Vec<String> = Vec::new();
+    zargs.push(format!("-{}", cfg.zstd_level));
+    zargs.push(match cfg.zstd_threads {
+        Some(n) => format!("-T{n}"),
+        None => "-T0".to_string(),
+    });
+    zargs.extend(["-q", "-f", "-o"].iter().map(|s| s.to_string()));
+    zargs.push(cfg.out.to_string_lossy().to_string());
+
+    let mut zstd = Command::new("zstd")
+        .args(&zargs)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn zstd")?;
+
+    // Archiver: options FIRST (GNU tar rejects options after positional
+    // args, and `-C` is positional: everything after it is archived from
+    // that directory). `.` = the whole tree, stored root-relative.
+    let mut targs: Vec<String> = vec!["-c".to_string()];
+    for e in cfg.excludes {
+        targs.push(format!("--exclude={e}"));
+    }
+    targs.push("-C".to_string());
+    targs.push(cfg.src.to_string_lossy().to_string());
+    targs.push(".".to_string());
+
+    let mut tar = Command::new("tar")
+        .args(&targs)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn `tar`")?;
+
+    let mut t_out = tar.stdout.take().expect("stdout piped");
+    let mut z_in = zstd.stdin.take().expect("stdin piped");
+    let raw = std::sync::Arc::new(AtomicU64::new(0));
+
+    // Pump thread: tar → compressor, counting raw bytes.
+    let raw_pump = raw.clone();
+    let pump = std::thread::spawn(move || {
+        let mut buf = [0u8; 1 << 16];
+        loop {
+            match t_out.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if z_in.write_all(&buf[..n]).is_err() {
+                        break; // compressor died
+                    }
+                    raw_pump.fetch_add(n as u64, Ordering::Relaxed);
+                }
+                Err(_) => break,
+            }
+        }
+        // z_in dropped here → compressor sees EOF.
+    });
+
+    // Progress: poll until the compressor finishes.
+    loop {
+        if zstd.try_wait().ok().flatten().is_some() {
+            break;
+        }
+        let written = std::fs::metadata(cfg.out).map(|m| m.len()).unwrap_or(0);
+        (cfg.on_progress)(raw.load(Ordering::Relaxed), written);
+        std::thread::sleep(std::time::Duration::from_millis(120));
+    }
+
+    let t_err_h = tar.stderr.take();
+    let t_status = tar.wait().context("waiting for tar")?;
+    let t_err = t_err_h.map(|mut h| stderr_text(&mut h)).unwrap_or_default();
+    let pump_res = pump.join();
+    let z_err_h = zstd.stderr.take();
+    let z_status = zstd.wait().context("waiting for zstd")?;
+    let z_err = z_err_h.map(|mut h| stderr_text(&mut h)).unwrap_or_default();
+
+    let raw_total = raw.load(Ordering::Relaxed);
+
+    if pump_res.is_err() {
+        bail!("pipe pump thread panicked while tarring {}", cfg.src.display());
+    }
+    if !t_status.success() {
+        let _ = std::fs::remove_file(cfg.out);
+        bail!(
+            "`tar {}` failed ({}): {}",
+            cfg.src.display(),
+            t_status.code().map(|c| c.to_string()).unwrap_or_default(),
+            t_err.trim()
+        );
+    }
+    if !z_status.success() {
+        let _ = std::fs::remove_file(cfg.out);
+        bail!("zstd compression failed: {}", z_err.trim());
+    }
+
+    let size = std::fs::metadata(cfg.out).map(|m| m.len()).unwrap_or(0);
+    Ok(SentStream {
+        name,
+        snapshot: cfg.src.to_path_buf(), // path actually read (snapshot or live tree)
+        out: cfg.out.to_path_buf(),
+        raw_bytes: raw_total,
+        size_bytes: size,
+    })
+}
+
 fn stderr_text(h: &mut std::process::ChildStderr) -> String {
     use std::io::Read as _;
     let mut b = Vec::new();

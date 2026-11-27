@@ -382,6 +382,7 @@ fn render_plan(f: &mut Frame, st: &State, area: ratatui::layout::Rect) {
                 for m in &it.methods {
                     let label = match m.kind {
                         crate::plan::MethodKind::Btrfs => format!("  →  {}/{}.zst   [btrfs-send]", it.category, it.name),
+                        crate::plan::MethodKind::Tar => format!("  →  {}   [tar+zstd]", m.artifact),
                         crate::plan::MethodKind::Borg => format!("  →  <repo>::{}   [borg]", m.artifact),
                     };
                     lines.push(Line::styled(label, Style::default().fg(Color::Green)));

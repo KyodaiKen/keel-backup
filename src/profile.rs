@@ -83,17 +83,21 @@ pub struct Source {
     pub name: Option<String>,
     /// Which methods back up this source, in order.
     /// Valid names: `btrfs` (snapshot stream + zstd), `borg` (deduplicated
-    /// archive into the configured repo).
+    /// archive into the configured repo), `tar` (whole-tree tar+zstd archive;
+    /// works on any filesystem and reads the CoW snapshot when the source is
+    /// a subvolume).
     ///
-    /// Omitted (or `null`) → legacy behavior: `btrfs` if the path is a btrfs
-    /// subvolume, error otherwise. A source can use any number of methods —
+    /// Omitted (or `null`) → subvolumes use `btrfs`, other trees use `tar`.
+    /// A source can use any number of methods —
     /// e.g. `[btrfs, borg]` produces both a fast stream and an incremental,
     /// deduplicated copy from the *same* consistent snapshot.
     #[serde(default)]
     pub methods: Option<Vec<String>>,
-    /// Exclusion patterns (engines that support them; borg patterns such as
-    /// `re:(?i).*/[^/]*cache[^/]*(/|$)`). btrfs streams carry the whole
-    /// subvolume — excludes do not apply to them.
+    /// Exclusion patterns — one list, applied by both tar and borg.
+    /// Recommended portable form: `**/blobs` (skips `blobs/` at any depth;
+    /// verified against GNU tar and borg 1.4.5). Plain `blobs` works for tar
+    /// only — borg anchors patterns. btrfs streams carry the whole subvolume
+    /// — excludes do not apply to them.
     #[serde(default)]
     pub excludes: Vec<String>,
 }

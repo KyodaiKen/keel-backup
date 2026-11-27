@@ -63,13 +63,15 @@ pub fn emit(ev: &EventArc, e: &RunEvent) {
 pub enum MethodKind {
     Btrfs,
     Borg,
+    Tar,
 }
 
 #[derive(Debug, Clone)]
 pub struct Method {
     pub kind: MethodKind,
     /// btrfs: stream path relative to the day dir (`os/rootfs.zst`);
-    /// borg: the archive name (no `::`).
+    /// tar:   tree archive relative to the day dir (`boot/boot.tar.zst`);
+    /// borg:  the archive name (no `::`).
     pub artifact: String,
 }
 
@@ -129,18 +131,18 @@ pub fn build_plan(profile_path: &Path, profile: &Profile) -> Result<Plan> {
             bail!("source {} does not exist", src.path.display());
         }
         let fs = crate::detect::fs_type(&src.path).unwrap_or_default();
-        if fs != "btrfs" {
-            bail!(
-                "source {} is on '{}' — keel currently needs btrfs subvolumes \
-                 (snapshot-based consistency for every method)",
-                src.path.display(),
-                fs
-            );
-        }
 
         // Resolve this source's methods.
         let kind_list: Vec<MethodKind> = match &src.methods {
-            None => vec![MethodKind::Btrfs],
+            None => {
+                // Default: subvolumes get the fast stream, other trees get a
+                // whole-tree archive (tar+zstd).
+                if fs == "btrfs" {
+                    vec![MethodKind::Btrfs]
+                } else {
+                    vec![MethodKind::Tar]
+                }
+            }
             Some(names) => {
                 if names.is_empty() {
                     bail!(
@@ -153,14 +155,31 @@ pub fn build_plan(profile_path: &Path, profile: &Profile) -> Result<Plan> {
                     .map(|n| match n.trim() {
                         "btrfs" | "btrfs-send" => Ok(MethodKind::Btrfs),
                         "borg" => Ok(MethodKind::Borg),
+                        "tar" | "tar-zstd" => Ok(MethodKind::Tar),
                         other => bail!(
-                            "source {} lists unknown method {other:?} (valid: btrfs, borg)",
+                            "source {} lists unknown method {other:?} (valid: btrfs, borg, tar)",
                             src.path.display()
                         ),
                     })
                     .collect::<Result<_>>()?
             }
         };
+
+        if kind_list.contains(&MethodKind::Btrfs) && fs != "btrfs" {
+            bail!(
+                "source {} is on '{fs}' — method `btrfs` needs a btrfs subvolume \n\nfor non-btrfs trees use methods: [tar] and/or [borg]",
+                src.path.display()
+            );
+        }
+
+        if kind_list.contains(&MethodKind::Tar) {
+            if which("tar").is_none() {
+                bail!("source {} uses method `tar` but no `tar` binary was found on PATH", src.path.display());
+            }
+            if which("zstd").is_none() {
+                bail!("source {} uses method `tar` but no `zstd` binary was found on PATH", src.path.display());
+            }
+        }
 
         if kind_list.contains(&MethodKind::Borg) {
             let bc = match borg_cfg.as_ref() {
@@ -193,6 +212,10 @@ pub fn build_plan(profile_path: &Path, profile: &Profile) -> Result<Plan> {
                 MethodKind::Borg => Method {
                     kind: MethodKind::Borg,
                     artifact: crate::borg::archive_name(&name),
+                },
+                MethodKind::Tar => Method {
+                    kind: MethodKind::Tar,
+                    artifact: format!("{category}/{name}.tar.zst"),
                 },
             })
             .collect();
@@ -350,36 +373,20 @@ pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Resu
     let mut borg_bootstrapped = false;
 
     for it in &plan.items {
-        // One consistent moment for the whole source, shared by all methods.
+        // One consistent moment for the whole source, shared by all methods —
+        // when the source is a btrfs subvolume. Non-subvolume trees (tar/borg
+        // only) are read live; the snapshot is deleted only after the last
+        // method has finished (success or failure).
         let snap_res = engine::snapshot(&it.source);
-        let snap = match snap_res {
-            Ok(s) => s,
-            Err(e) => {
-                any_fail = true;
-                let fail_entries: Vec<crate::manifest::MethodEntry> = it.methods.iter().map(|m| crate::manifest::MethodEntry {
-                    engine: engine_label(m.kind),
-                    ok: false,
-                    error: Some(format!("snapshot: {e:#}")),
-                    snapshot: String::new(),
-                    stream_rel: None,
-                    raw_bytes: None,
-                    size_bytes: None,
-                    archive: None,
-                    repo: None,
-                }).collect();
-                manifest.entries.push(crate::manifest::SourceEntry {
-                    name: it.name.clone(),
-                    source: it.source.display().to_string(),
-                    category: it.category.clone(),
-                    methods: fail_entries,
-                });
-                emit(ev, &RunEvent::SourceFail { idx: it.idx, err: format!("snapshot: {e:#}") });
-                continue;
-            }
-        };
+        let snap_opt = snap_res.as_ref().ok().map(|s| s.clone());
         let mut guard = SnapGuard::new();
-        guard.add(snap.clone());
-
+        if let Some(s) = &snap_opt {
+            guard.add(s.clone());
+        }
+        let live_or_snap: PathBuf = match &snap_opt {
+            Some(s) => s.clone(),
+            None => it.source.clone(),
+        };
         let src = profile.sources.iter().find(|s| s.path == it.source)
             .expect("plan item source must exist in profile");
         let mut m_entries: Vec<crate::manifest::MethodEntry> = Vec::new();
@@ -387,6 +394,28 @@ pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Resu
         for m in &it.methods {
             match m.kind {
                 MethodKind::Btrfs => {
+                    // btrfs-send requires the CoW snapshot.
+                    let snap = match &snap_opt {
+                        Some(s) => s,
+                        None => {
+                            let err = format!("{} (method `btrfs` needs a btrfs subvolume)",
+                                snap_res.as_ref().unwrap_err());
+                            any_fail = true;
+                            m_entries.push(crate::manifest::MethodEntry {
+                                engine: "btrfs-send".into(),
+                                ok: false,
+                                error: Some(err.clone()),
+                                snapshot: String::new(),
+                                stream_rel: Some(m.artifact.clone()),
+                                raw_bytes: None,
+                                size_bytes: None,
+                                archive: None,
+                                repo: None,
+                            });
+                            emit(ev, &RunEvent::SourceFail { idx: it.idx, err });
+                            continue;
+                        }
+                    };
                     let out = day.join(&m.artifact);
                     if let Some(parent) = out.parent() {
                         std::fs::create_dir_all(parent)?;
@@ -405,7 +434,7 @@ pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Resu
                     let res = (|| -> anyhow::Result<engine::SentStream> {
                         engine::send_stream(&engine::SendStreamConfig {
                             name: &name,
-                            snapshot: &snap,
+                            snapshot: snap,
                             out: &out_c,
                             zstd_level: profile.engines.zstd_level,
                             zstd_threads: profile.engines.zstd_threads,
@@ -457,6 +486,82 @@ pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Resu
                             emit(ev, &RunEvent::SourceFail { idx: it.idx, err: format!("{e:#}") });
                         }
                     }
+
+                }
+                MethodKind::Tar => {
+                    let out = day.join(&m.artifact);
+                    if let Some(parent) = out.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    emit(
+                        ev,
+                        &RunEvent::SourceStart {
+                            idx: it.idx,
+                            label: it.source.display().to_string(),
+                            engine: "tar".into(),
+                            out_rel: m.artifact.clone(),
+                        },
+                    );
+                    let name = it.name.clone();
+                    let out_c = out.clone();
+                    let read_from = live_or_snap.clone();
+                    let excludes: Vec<String> = src.excludes.clone();
+                    let res = (|| -> anyhow::Result<engine::SentStream> {
+                        engine::tar_stream(&engine::TarStreamConfig {
+                            name: &name,
+                            src: &read_from,
+                            excludes: &excludes,
+                            out: &out_c,
+                            zstd_level: profile.engines.zstd_level,
+                            zstd_threads: profile.engines.zstd_threads,
+                            on_progress: &|raw, written| {
+                                emit(ev, &RunEvent::Progress { idx: it.idx, raw, written });
+                            },
+                        })
+                    })();
+                    match res {
+                        Ok(s) => {
+                            m_entries.push(crate::manifest::MethodEntry {
+                                engine: "tar".into(),
+                                ok: true,
+                                error: None,
+                                snapshot: s.snapshot.display().to_string(),
+                                stream_rel: Some(m.artifact.clone()),
+                                raw_bytes: Some(s.raw_bytes),
+                                size_bytes: Some(s.size_bytes),
+                                archive: None,
+                                repo: None,
+                            });
+                            emit(
+                                ev,
+                                &RunEvent::SourceOk {
+                                    idx: it.idx,
+                                    engine: "tar".into(),
+                                    note: format!(
+                                        "{} raw → {} compressed ({})",
+                                        engine::human(s.raw_bytes),
+                                        engine::human(s.size_bytes),
+                                        m.artifact
+                                    ),
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            any_fail = true;
+                            m_entries.push(crate::manifest::MethodEntry {
+                                engine: "tar".into(),
+                                ok: false,
+                                error: Some(format!("{e:#}")),
+                                snapshot: live_or_snap.display().to_string(),
+                                stream_rel: Some(m.artifact.clone()),
+                                raw_bytes: None,
+                                size_bytes: None,
+                                archive: None,
+                                repo: None,
+                            });
+                            emit(ev, &RunEvent::SourceFail { idx: it.idx, err: format!("{e:#}") });
+                        }
+                    }
                 }
                 MethodKind::Borg => {
                     let bc = profile.methods.borg.as_ref().expect("validated in build_plan");
@@ -472,7 +577,7 @@ pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Resu
                     let cfg = crate::borg::BorgCreateConfig {
                         repo: bc.repo.clone(),
                         passphrase_file: bc.passphrase_file.clone(),
-                        snapshot: snap.clone(),
+                        snapshot: live_or_snap.clone(),
                         archive: m.artifact.clone(),
                         compression: bc.compression.clone(),
                         excludes: src.excludes.clone(),
@@ -496,7 +601,7 @@ pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Resu
                                 engine: "borg".into(),
                                 ok: true,
                                 error: None,
-                                snapshot: snap.display().to_string(),
+                                snapshot: live_or_snap.display().to_string(),
                                 stream_rel: None,
                                 raw_bytes: None,
                                 size_bytes: None,
@@ -518,7 +623,7 @@ pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Resu
                                 engine: "borg".into(),
                                 ok: false,
                                 error: Some(format!("{e:#}")),
-                                snapshot: snap.display().to_string(),
+                                snapshot: live_or_snap.display().to_string(),
                                 stream_rel: None,
                                 raw_bytes: None,
                                 size_bytes: None,
@@ -617,6 +722,7 @@ fn engine_label(k: MethodKind) -> String {
     match k {
         MethodKind::Btrfs => "btrfs-send".into(),
         MethodKind::Borg => "borg".into(),
+        MethodKind::Tar => "tar".into(),
     }
 }
 
@@ -630,6 +736,7 @@ fn describe_method(m: &Method, profile: &Profile) -> String {
                 "borg".into()
             }
         }
+        MethodKind::Tar => "tar+zstd (whole tree, excludes applied)".into(),
     }
 }
 

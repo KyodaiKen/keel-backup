@@ -19,6 +19,11 @@ RECV="/keel-live-recv"   # must be on a btrfs fs (/tmp is not btrfs)
 PROFILE="/tmp/keel-live-profile.yaml"
 EXT1="/tmp/keel-borg-ext1"
 EXT2="/tmp/keel-borg-ext2"
+TAR_SRC="/tmp/keel-tarsrc"
+REPO_TAR="/tmp/borg-keel-test-tar"
+TAR_PROFILE="/tmp/keel-tar-profile.yaml"
+EXT3="/tmp/keel-tar-ext3"
+EXT4="/tmp/keel-borg-ext4"
 FAIL=0
 
 cleanup() {
@@ -26,7 +31,8 @@ cleanup() {
     # received subvolumes must be deleted as subvolumes before rm -rf
     local sv
     while IFS= read -r sv; do btrfs subvolume delete "$sv" 2>/dev/null; done < <(find "$RECV" -type d 2>/dev/null)
-    rm -rf "$DEST" "$REPO" "$BP" "$RECV" "$PROFILE" "$EXT1" "$EXT2"
+    rm -rf "$DEST" "$REPO" "$BP" "$RECV" "$PROFILE" "$EXT1" "$EXT2" \
+           "$TAR_SRC" "$REPO_TAR" "$TAR_PROFILE" "$EXT3" "$EXT4"
 }
 trap cleanup EXIT
 
@@ -137,6 +143,72 @@ rm -rf "$EXT2"; mkdir -p "$EXT2"
 out2=$(find "$EXT2" -name hello.txt 2>/dev/null | head -1 | xargs -r cat)
 [ "$out2" = "$(cat "$SNAP/hello.txt")" ]; check $? "retained archive still readable"
 rm -rf "$EXT2"
+
+# --- tar engine on a NON-btrfs tree (any filesystem) ------------------------
+mkdir -p "$TAR_SRC/a" "$TAR_SRC/blobs" "$TAR_SRC/ollama-models/blobs" "$TAR_SRC/x/blobs"
+cp "$SNAP/hello.txt" "$TAR_SRC/a/hello.txt"
+echo junk  > "$TAR_SRC/blobs/j.bin"
+echo junk2 > "$TAR_SRC/ollama-models/blobs/deep.bin"
+echo junk3 > "$TAR_SRC/x/blobs/n.bin"
+cat > "$TAR_PROFILE" <<EOF
+name: keel-live-test-tar
+destination:
+  candidates: []
+  mount_point: $DEST
+  backups_dir: backups
+sources:
+  - name: tarsrc
+    path: $TAR_SRC
+    category: extra
+    methods: [tar, borg]
+    excludes: ["**/blobs"]
+methods:
+  borg:
+    repo: $REPO_TAR
+    passphrase_file: $BP
+    compression: zstd,6
+    keep_daily: 2
+    keep_weekly: 0
+    keep_monthly: 0
+engines:
+  zstd_level: 6
+retention:
+  keep: 2
+EOF
+
+step "keel tar run (non-btrfs tree + excludes, tar + borg)"
+"$KEEL" run --profile "$TAR_PROFILE" --yes
+check $? "tar run exit code"
+
+TARTAR="$DEST/backups/$(date -u +%F)/$(hostname -s)/extra/tarsrc.tar.zst"
+[ -f "$TARTAR" ]; check $? "tar artifact exists ($TARTAR)"
+zstd -tq "$TARTAR"; check $? "zstd integrity of tar artifact"
+
+tlst=$(zstd -dc "$TARTAR" | tar -t 2>/dev/null | sort)
+echo "$tlst"
+echo "$tlst" | grep -q 'a/hello.txt'; check $? "tar contains a/hello.txt"
+! echo "$tlst" | grep -q 'blobs'; check $? "tar excluded all **/blobs (top-level, nested, ollama-models/blobs)"
+
+rm -rf "$EXT3"; mkdir -p "$EXT3"
+tar -xf "$TARTAR" -C "$EXT3"
+out3=$(find "$EXT3" -name hello.txt 2>/dev/null | head -1 | xargs -r cat)
+[ "$out3" = "$(cat "$SNAP/hello.txt")" ]; check $? "tar-extracted hello.txt matches original"
+[ -z "$(find "$EXT3" -path '*blobs*' 2>/dev/null)" ]; check $? "no blobs dirs in extracted tar tree"
+rm -rf "$EXT3"
+
+tlist=$(BORG_PASSPHRASE="$(cat "$BP")" BORG_RELOCATED_REPO_ACCESS_IS_OK=yes borg list --short "$REPO_TAR" 2>/dev/null)
+echo "$tlist"
+tarch=$(echo "$tlist" | grep -i 'tarsrc-[0-9]' | tail -1)
+[ -n "$tarch" ]; check $? "borg repo has tarsrc archive"
+tarchfiles=$(BORG_PASSPHRASE="$(cat "$BP")" BORG_RELOCATED_REPO_ACCESS_IS_OK=yes borg list --short "$REPO_TAR::$tarch" 2>/dev/null | sort)
+echo "$tarchfiles" | grep -q 'a/hello.txt'; check $? "borg archive contains a/hello.txt"
+! echo "$tarchfiles" | grep -q 'blobs'; check $? "borg archive excluded all **/blobs"
+rm -rf "$EXT4"; mkdir -p "$EXT4"
+(cd "$EXT4" && BORG_PASSPHRASE="$(cat "$BP")" BORG_RELOCATED_REPO_ACCESS_IS_OK=yes borg extract "$REPO_TAR::$tarch" >/dev/null 2>&1)
+out4=$(find "$EXT4" -name hello.txt 2>/dev/null | head -1 | xargs -r cat)
+[ "$out4" = "$(cat "$SNAP/hello.txt")" ]; check $? "borg-extracted hello.txt (non-btrfs tree) matches"
+[ -z "$(find "$EXT4" -path '*blobs*' 2>/dev/null)" ]; check $? "borg-extracted tree has no blobs"
+rm -rf "$EXT4"
 
 step "NEGATIVE TEST: missing passphrase file + existing repo must REFUSE"
 mv "$BP" "$BP.hidden"

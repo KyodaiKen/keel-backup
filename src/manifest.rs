@@ -85,7 +85,16 @@ pub struct RunManifest {
 
 impl RunManifest {
     pub fn new(plan: &Plan, _profile: &Profile) -> Self {
-        let has_borg = plan.items.iter().any(|i| i.methods.iter().any(|m| m.kind == crate::plan::MethodKind::Borg));
+        let mut hints: Vec<String> = Vec::new();
+        if plan.items.iter().any(|i| i.methods.iter().any(|m| m.kind == crate::plan::MethodKind::Btrfs)) {
+            hints.push("btrfs streams: `zstd -dc < day/.../os/rootfs.zst | btrfs receive /target` (target on a btrfs fs; creates /target/<source>)".into());
+        }
+        if plan.items.iter().any(|i| i.methods.iter().any(|m| m.kind == crate::plan::MethodKind::Tar)) {
+            hints.push("tar archives: `zstd -dc < day/.../boot/boot.tar.zst | tar -x -C /target` (entries are stored tree-root-relative, e.g. ./efi/...)".into());
+        }
+        if plan.items.iter().any(|i| i.methods.iter().any(|m| m.kind == crate::plan::MethodKind::Borg)) {
+            hints.push("borg archives: `cd /target && borg extract <repo>::<archive>` (extracts into the current directory; paths stored root-relative, e.g. home/kyo/...) or `borg mount <repo> /mnt/point` (read-only, all archives)".into());
+        }
         Self {
             format: "keel/2".into(),
             host: hostname(),
@@ -96,11 +105,7 @@ impl RunManifest {
             day_dir: plan.day_dir.display().to_string(),
             complete: false,
             entries: Vec::new(),
-            restore_hint: if has_borg {
-                "btrfs streams: `zstd -dc < day/.../os/rootfs.zst | btrfs receive /target` (target on a btrfs fs; creates /target/<source>); borg archives: `cd /target && borg extract <repo>::<archive>` (extracts into the current directory; paths stored root-relative, e.g. home/kyo/...) or `borg mount <repo> /mnt/point` (read-only, all archives)".into()
-            } else {
-                "btrfs send/receive streams: `zstd -dc < day/.../os/rootfs.zst | btrfs receive /target` (target on a btrfs fs; creates /target/<source>; Phase 1 ships a generated live-media restore script)".into()
-            },
+            restore_hint: hints.join("; "),
         }
     }
 

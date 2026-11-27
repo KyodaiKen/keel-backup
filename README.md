@@ -17,22 +17,28 @@ The keel is the load-bearing spine of a ship — the thing that keeps it upright
 when the sea comes over the side. A bare-metal backup is exactly that for a
 system.
 
-## Phase 0 (current)
+## What keel does today
 
 - Capability registry with per-capability *why* (visible in TUI + `keel doctor`)
 - Profile YAML: destination candidates, sources, engines, retention, env file
 - Destination auto-mount (uuid / label / device / pre-mounted path) + write test
-- btrfs send → zstd streams with **real** byte-counting progress (no `pv`)
 - Consistent CoW snapshots, cleaned on every exit path (even Ctrl-C)
-- `manifest.yaml` receipt per backup day
-- Retention: keep newest N day directories per host
+- Engines:
+  - **btrfs-send → zstd** streams with real byte-counting progress (no `pv`)
+  - **tar + zstd** whole-tree archives — any filesystem; honors `excludes`
+  - **borg** — deduplicated, incremental repokey archives; passphrase
+    bootstrap or hard refusal (never invents one), prune, `excludes`
+- A source can use several engines — `methods: [btrfs, borg]` gives both a
+  fast stream and a deduplicated copy from the *same* consistent snapshot
+- `manifest.yaml` receipt per backup day (what was taken, where, how to restore)
+- Retention: keep newest N day directories per host (+ borg keep_daily/weekly/monthly)
 - TUI: capabilities / plan / profile / live log — start a run with Enter
 - CLI: `keel run` with `indicatif` counters, `--dry-run`, `-y`
 
 ## Later phases
 
-1. tar+zstd & squashfs engines (non-btrfs trees), exclude globs
-2. borg (env-file passphrase), pg-dump, podman-save, systemd state
+1. ~~tar+zstd engine (non-btrfs trees)~~ ✅ · squashfs engine — pending
+2. ~~borg (env-file passphrase)~~ ✅ · pg-dump, podman-save, systemd state — pending
 3. GPT/EFI/creds bare-metal dump + **generated live-media restore script**
 4. `musl` static binary, packaging
 

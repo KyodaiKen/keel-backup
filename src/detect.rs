@@ -200,7 +200,7 @@ pub fn registry() -> Vec<Capability> {
             "tar or zstd missing".into()
         },
         evidence: vec![format!("tar = {:?}", tar_bin), format!("zstd = {:?}", zstd_bin)],
-        implemented: false,
+        implemented: true,
     });
 
     caps.push(Capability {
