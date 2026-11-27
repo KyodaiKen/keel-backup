@@ -17,6 +17,8 @@ REPO="/tmp/borg-keel-test"
 BP="/tmp/keel-bp-test"
 RECV="/keel-live-recv"   # must be on a btrfs fs (/tmp is not btrfs)
 PROFILE="/tmp/keel-live-profile.yaml"
+EXT1="/tmp/keel-borg-ext1"
+EXT2="/tmp/keel-borg-ext2"
 FAIL=0
 
 cleanup() {
@@ -24,7 +26,7 @@ cleanup() {
     # received subvolumes must be deleted as subvolumes before rm -rf
     local sv
     while IFS= read -r sv; do btrfs subvolume delete "$sv" 2>/dev/null; done < <(find "$RECV" -type d 2>/dev/null)
-    rm -rf "$DEST" "$REPO" "$BP" "$RECV" "$PROFILE"
+    rm -rf "$DEST" "$REPO" "$BP" "$RECV" "$PROFILE" "$EXT1" "$EXT2"
 }
 trap cleanup EXIT
 
@@ -111,7 +113,8 @@ step "verify borg content (extract)"
 arch1=$(echo "$list1" | grep 'live-[0-9]' | tail -1)
 EXT1="/tmp/keel-borg-ext1"
 rm -rf "$EXT1"; mkdir -p "$EXT1"
-BORG_PASSPHRASE="$(cat "$BP")" BORG_RELOCATED_REPO_ACCESS_IS_OK=yes borg extract "$REPO::$arch1" "$EXT1" 2>/dev/null
+# borg extract restores into the CWD (extra args are filters, not a target)
+(cd "$EXT1" && BORG_PASSPHRASE="$(cat "$BP")" BORG_RELOCATED_REPO_ACCESS_IS_OK=yes borg extract "$REPO::$arch1" >/dev/null 2>&1)
 out=$(find "$EXT1" -name hello.txt 2>/dev/null | head -1 | xargs -r cat)
 echo "$out"
 [ "$out" = "$(cat "$SNAP/hello.txt")" ]; check $? "borg-extracted hello.txt matches original"
@@ -130,7 +133,7 @@ n2=$(echo "$list2" | grep -c 'live-[0-9]')
 arch2=$(echo "$list2" | grep 'live-[0-9]' | tail -1)
 EXT2="/tmp/keel-borg-ext2"
 rm -rf "$EXT2"; mkdir -p "$EXT2"
-BORG_PASSPHRASE="$(cat "$BP")" BORG_RELOCATED_REPO_ACCESS_IS_OK=yes borg extract "$REPO::$arch2" "$EXT2" 2>/dev/null
+(cd "$EXT2" && BORG_PASSPHRASE="$(cat "$BP")" BORG_RELOCATED_REPO_ACCESS_IS_OK=yes borg extract "$REPO::$arch2" >/dev/null 2>&1)
 out2=$(find "$EXT2" -name hello.txt 2>/dev/null | head -1 | xargs -r cat)
 [ "$out2" = "$(cat "$SNAP/hello.txt")" ]; check $? "retained archive still readable"
 rm -rf "$EXT2"
