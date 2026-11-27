@@ -10,7 +10,7 @@
 # Needs root (snapshots + btrfs). Run:  sudo bash tests/live-borg.sh
 set -u
 
-KEEL="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/debug/keel"
+KEEL="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/release/keel"
 SNAP="/keel-live"
 DEST="/tmp/keel-live-dest"
 REPO="/tmp/borg-keel-test"
@@ -80,8 +80,8 @@ step "verify stream artifact"
 zstd -tq "$STREAM"; check $? "zstd integrity of stream"
 
 step "verify stream content (btrfs receive)"
-btrfs receive "$RECV" <(zstd -dc "$STREAM")
-check $? "btrfs receive"
+zstd -dc "$STREAM" | btrfs receive "$RECV"
+check "${PIPESTATUS[1]}" "btrfs receive"
 received=$(find "$RECV" -name hello.txt | head -1)
 [ -n "$received" ]; check $? "hello.txt inside received subvolume"
 if [ -n "$received" ]; then

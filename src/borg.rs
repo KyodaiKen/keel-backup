@@ -11,7 +11,7 @@
 //!   same flag for exactly this reason)
 //!
 //! Security posture (safest unattended mode):
-//! - new repos are created with `repokey-passphrase`: the key sits with the
+//! - new repos are created with `repokey`: the key sits with the
 //!   repo (on the SSD) and the passphrase lives elsewhere (passphrase file).
 //!   Stealing the SSD alone yields nothing.
 //! - keel NEVER invents a passphrase for an existing repo — that would be a
@@ -145,7 +145,7 @@ pub fn create(cfg: &BorgCreateConfig) -> Result<(String, bool)> {
         .with_context(|| format!("creating parent for borg repo {}", cfg.repo.display()))?;
 
     if !repo_exists(&cfg.repo) {
-        let mut init_args: Vec<String> = vec!["init".into(), "--encryption=repokey-passphrase".into()];
+        let mut init_args: Vec<String> = vec!["init".into(), "--encryption=repokey".into()];
         init_args.push(cfg.repo.to_string_lossy().to_string());
         run_borg(&init_args, &passphrase, "init")?;
     }

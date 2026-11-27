@@ -142,7 +142,7 @@ pub struct Methods {
 #[serde(deny_unknown_fields)]
 pub struct BorgMethod {
     /// Repo directory (local path; ssh:// URLs work too — borg handles them).
-    /// Created automatically on first run with `repokey-passphrase`
+    /// Created automatically on first run with `repokey`
     /// encryption (the safest unattended mode: the repo alone is useless
     /// without the passphrase).
     pub repo: PathBuf,
