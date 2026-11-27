@@ -16,7 +16,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::detect::{euid, free_bytes, hostname, parse_size, which};
 use crate::engine::{self, SnapGuard};
-use crate::profile::{Destination, DestinationCandidate, Profile};
+use crate::profile::{Destination, DestinationCandidate, Profile, SourceSpec};
 
 /// Events emitted by the pipeline (CLI prints + bars, TUI renders).
 #[derive(Debug, Clone)]
@@ -64,14 +64,22 @@ pub enum MethodKind {
     Btrfs,
     Borg,
     Tar,
+    Squashfs,
+    PgDump,
+    PodmanSave,
+    SystemdState,
 }
 
 #[derive(Debug, Clone)]
 pub struct Method {
     pub kind: MethodKind,
-    /// btrfs: stream path relative to the day dir (`os/rootfs.zst`);
-    /// tar:   tree archive relative to the day dir (`boot/boot.tar.zst`);
-    /// borg:  the archive name (no `::`).
+    /// btrfs:    stream path relative to the day dir (`os/rootfs.zst`);
+    /// tar:      tree archive relative to the day dir (`boot/boot.tar.zst`);
+    /// squashfs: image relative to the day dir (`home/home.squashfs`);
+    /// pg-dump:  dump file (`extra/pg-weather.dump`);
+    /// podman:   image tar (`extra/podman.tar`);
+    /// systemd:  unit-state yaml (`extra/systemd-state.yaml`);
+    /// borg:     the archive name (no `::`).
     pub artifact: String,
 }
 
@@ -79,7 +87,15 @@ pub struct Method {
 pub struct PlanItem {
     pub idx: usize,
     pub name: String,
-    pub source: PathBuf,
+    /// Display string (`/path`, `pg_dump database x`, `podman: img1, img2`, …).
+    pub source: String,
+    /// The tree path when the source is a tree (snapshot + tree engines read it);
+    /// None for pg_dump / podman_save / systemd_state.
+    pub tree: Option<PathBuf>,
+    /// Exclude patterns (tree sources only).
+    pub excludes: Vec<String>,
+    /// The profile source spec (pg/podman params at run time).
+    pub spec: SourceSpec,
     pub category: String,
     pub methods: Vec<Method>,
 }
@@ -123,110 +139,209 @@ pub fn build_plan(profile_path: &Path, profile: &Profile) -> Result<Plan> {
     let borg_bin = which("borg");
 
     let mut items = Vec::new();
-    for (i, src) in profile.sources.iter().enumerate() {
-        if !src.path.is_absolute() {
-            bail!("source {} is not an absolute path", src.path.display());
-        }
-        if !src.path.exists() {
-            bail!("source {} does not exist", src.path.display());
-        }
-        let fs = crate::detect::fs_type(&src.path).unwrap_or_default();
-
-        // Resolve this source's methods.
-        let kind_list: Vec<MethodKind> = match &src.methods {
-            None => {
-                // Default: subvolumes get the fast stream, other trees get a
-                // whole-tree archive (tar+zstd).
-                if fs == "btrfs" {
-                    vec![MethodKind::Btrfs]
-                } else {
-                    vec![MethodKind::Tar]
-                }
-            }
-            Some(names) => {
-                if names.is_empty() {
-                    bail!(
-                        "source {} lists `methods: []` — nothing would back it up",
-                        src.path.display()
-                    );
-                }
-                names
-                    .iter()
-                    .map(|n| match n.trim() {
-                        "btrfs" | "btrfs-send" => Ok(MethodKind::Btrfs),
-                        "borg" => Ok(MethodKind::Borg),
-                        "tar" | "tar-zstd" => Ok(MethodKind::Tar),
-                        other => bail!(
-                            "source {} lists unknown method {other:?} (valid: btrfs, borg, tar)",
-                            src.path.display()
-                        ),
-                    })
-                    .collect::<Result<_>>()?
-            }
-        };
-
-        if kind_list.contains(&MethodKind::Btrfs) && fs != "btrfs" {
-            bail!(
-                "source {} is on '{fs}' — method `btrfs` needs a btrfs subvolume \n\nfor non-btrfs trees use methods: [tar] and/or [borg]",
-                src.path.display()
-            );
-        }
-
-        if kind_list.contains(&MethodKind::Tar) {
-            if which("tar").is_none() {
-                bail!("source {} uses method `tar` but no `tar` binary was found on PATH", src.path.display());
-            }
-            if which("zstd").is_none() {
-                bail!("source {} uses method `tar` but no `zstd` binary was found on PATH", src.path.display());
-            }
-        }
-
-        if kind_list.contains(&MethodKind::Borg) {
-            let bc = match borg_cfg.as_ref() {
-                Some(bc) => bc,
-                None => bail!(
-                    "source {} uses method `borg` but the profile has no `methods.borg` block \
-                     (repo + passphrase_file are required)",
-                    src.path.display()
-                ),
-            };
-            if borg_bin.is_none() {
-                bail!("source {} uses method `borg` but no `borg` binary was found on PATH", src.path.display());
-            }
-            let _ = bc; // settings validated at run time
-        }
-
-        let name = src.name.clone().unwrap_or_else(|| engine::name_for(&src.path));
-        let category = if src.category.is_empty() {
+    for (i, spec) in profile.sources.iter().enumerate() {
+        let category = if spec.category().is_empty() {
             "extra".into()
         } else {
-            src.category.clone()
+            spec.category()
         };
-        let methods: Vec<Method> = kind_list
-            .iter()
-            .map(|k| match k {
-                MethodKind::Btrfs => Method {
-                    kind: MethodKind::Btrfs,
-                    artifact: format!("{category}/{name}.zst"),
-                },
-                MethodKind::Borg => Method {
-                    kind: MethodKind::Borg,
-                    artifact: crate::borg::archive_name(&name),
-                },
-                MethodKind::Tar => Method {
-                    kind: MethodKind::Tar,
-                    artifact: format!("{category}/{name}.tar.zst"),
-                },
-            })
-            .collect();
+        match spec {
+            SourceSpec::Tree { path, methods, excludes, name, .. } => {
+                if !path.is_absolute() {
+                    bail!("sources[{}].path must be absolute (got {})", i, path.display());
+                }
+                if !path.exists() {
+                    bail!("sources[{}].path does not exist: {}", i, path.display());
+                }
+                let fs = crate::detect::fs_type(path).unwrap_or_default();
 
-        items.push(PlanItem {
-            idx: i,
-            name,
-            source: src.path.clone(),
-            category,
-            methods,
-        });
+                // Resolve this source's methods.
+                let kind_list: Vec<MethodKind> = match methods {
+                    None => {
+                        // Default: subvolumes get the fast stream, other trees
+                        // get a whole-tree archive (tar+zstd).
+                        if fs == "btrfs" {
+                            vec![MethodKind::Btrfs]
+                        } else {
+                            vec![MethodKind::Tar]
+                        }
+                    }
+                    Some(names) => {
+                        if names.is_empty() {
+                            bail!(
+                                "sources[{}]: `methods: []` would back the tree up with nothing",
+                                i
+                            );
+                        }
+                        names
+                            .iter()
+                            .map(|n| match n.trim() {
+                                "btrfs" | "btrfs-send" => Ok(MethodKind::Btrfs),
+                                "borg" => Ok(MethodKind::Borg),
+                                "tar" | "tar-zstd" => Ok(MethodKind::Tar),
+                                "squashfs" | "squash" => Ok(MethodKind::Squashfs),
+                                other => bail!(
+                                    "sources[{}]: unknown method {other:?} (valid: btrfs, borg, tar, squashfs)",
+                                    i
+                                ),
+                            })
+                            .collect::<Result<_>>()?
+                    }
+                };
+
+                if kind_list.contains(&MethodKind::Btrfs) && fs != "btrfs" {
+                    bail!(
+                        "sources[{}]: {} is on '{fs}' — method `btrfs` needs a btrfs subvolume \n\nfor non-btrfs trees use methods: [tar], [borg] and/or [squashfs]",
+                        i, path.display()
+                    );
+                }
+
+                if kind_list.contains(&MethodKind::Tar) {
+                    if which("tar").is_none() {
+                        bail!("sources[{}]: method `tar` but no `tar` binary on PATH", i);
+                    }
+                    if which("zstd").is_none() {
+                        bail!("sources[{}]: method `tar` but no `zstd` binary on PATH", i);
+                    }
+                }
+                if kind_list.contains(&MethodKind::Squashfs) {
+                    if which("mksquashfs").is_none() {
+                        bail!(
+                            "sources[{}]: method `squashfs` but no `mksquashfs` binary on PATH (squashfs-tools)",
+                            i
+                        );
+                    }
+                }
+                if kind_list.contains(&MethodKind::Borg) {
+                    let bc = match borg_cfg.as_ref() {
+                        Some(bc) => bc,
+                        None => bail!(
+                            "sources[{}]: method `borg` but the profile has no `methods.borg` block \n(repo + passphrase_file are required)",
+                            i
+                        ),
+                    };
+                    if borg_bin.is_none() {
+                        bail!("sources[{}]: method `borg` but no `borg` binary on PATH", i);
+                    }
+                    let _ = bc; // settings validated at run time
+                }
+
+                let name = name.clone().unwrap_or_else(|| engine::name_for(path));
+                let methods_art: Vec<Method> = kind_list
+                    .iter()
+                    .map(|k| match k {
+                        MethodKind::Btrfs => Method {
+                            kind: MethodKind::Btrfs,
+                            artifact: format!("{category}/{name}.zst"),
+                        },
+                        MethodKind::Borg => Method {
+                            kind: MethodKind::Borg,
+                            artifact: crate::borg::archive_name(&name),
+                        },
+                        MethodKind::Tar => Method {
+                            kind: MethodKind::Tar,
+                            artifact: format!("{category}/{name}.tar.zst"),
+                        },
+                        MethodKind::Squashfs => Method {
+                            kind: MethodKind::Squashfs,
+                            artifact: format!("{category}/{name}.squashfs"),
+                        },
+                        _ => unreachable!("tree source with a non-tree method"),
+                    })
+                    .collect();
+
+                items.push(PlanItem {
+                    idx: i,
+                    name,
+                    source: path.display().to_string(),
+                    tree: Some(path.clone()),
+                    excludes: excludes.clone(),
+                    spec: spec.clone(),
+                    category,
+                    methods: methods_art,
+                });
+            }
+            SourceSpec::PgDump { database, host, .. } => {
+                if database.trim().is_empty() {
+                    bail!("sources[{}]: pg_dump source needs a non-empty `database`", i);
+                }
+                if which("pg_dump").is_none() {
+                    bail!(
+                        "sources[{}]: pg_dump source but no `pg_dump` binary on PATH (postgresql client tools)",
+                        i
+                    );
+                }
+                let name = spec.name().unwrap_or_else(|| format!("pg-{database}"));
+                items.push(PlanItem {
+                    idx: i,
+                    name: name.clone(),
+                    source: format!(
+                        "pg_dump database {}{}",
+                        database,
+                        host.as_ref().map(|h| format!(" (host {h})")).unwrap_or_default()
+                    ),
+                    tree: None,
+                    excludes: Vec::new(),
+                    spec: spec.clone(),
+                    category: category.clone(),
+                    methods: vec![Method {
+                        kind: MethodKind::PgDump,
+                        artifact: format!("{category}/{name}.dump"),
+                    }],
+                });
+            }
+            SourceSpec::PodmanSave { images, commit, .. } => {
+                if images.is_empty() && commit.is_none() {
+                    bail!(
+                        "sources[{}]: podman_save source needs at least one `images:` entry or a `commit:`",
+                        i
+                    );
+                }
+                if which("podman").is_none() {
+                    bail!("sources[{}]: podman_save source but no `podman` binary on PATH", i);
+                }
+                let name = spec.name().unwrap_or_else(|| "podman".into());
+                items.push(PlanItem {
+                    idx: i,
+                    name: name.clone(),
+                    source: format!(
+                        "podman: {}{}",
+                        images.join(", "),
+                        commit
+                            .as_ref()
+                            .map(|c| format!(" (+ commit {} → {})", c.container, c.tag))
+                            .unwrap_or_default()
+                    ),
+                    tree: None,
+                    excludes: Vec::new(),
+                    spec: spec.clone(),
+                    category: category.clone(),
+                    methods: vec![Method {
+                        kind: MethodKind::PodmanSave,
+                        artifact: format!("{category}/{name}.tar"),
+                    }],
+                });
+            }
+            SourceSpec::SystemdState { .. } => {
+                if which("systemctl").is_none() {
+                    bail!("sources[{}]: systemd_state source but no `systemctl` binary on PATH", i);
+                }
+                let name = spec.name().unwrap_or_else(|| "systemd-state".into());
+                items.push(PlanItem {
+                    idx: i,
+                    name: name.clone(),
+                    source: "systemd unit files (list-unit-files)".into(),
+                    tree: None,
+                    excludes: Vec::new(),
+                    spec: spec.clone(),
+                    category: category.clone(),
+                    methods: vec![Method {
+                        kind: MethodKind::SystemdState,
+                        artifact: format!("{category}/{name}.yaml"),
+                    }],
+                });
+            }
+        }
     }
 
     Ok(Plan {
@@ -341,7 +456,7 @@ pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Resu
                     ev,
                     &RunEvent::SourceStart {
                         idx: it.idx,
-                        label: format!("{} [{}]", it.source.display(), describe_method(m, profile)),
+                        label: format!("{} [{}]", it.source, describe_method(m, profile)),
                         engine: engine_label(m.kind),
                         out_rel: m.artifact.clone(),
                     },
@@ -377,18 +492,25 @@ pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Resu
         // when the source is a btrfs subvolume. Non-subvolume trees (tar/borg
         // only) are read live; the snapshot is deleted only after the last
         // method has finished (success or failure).
-        let snap_res = engine::snapshot(&it.source);
-        let snap_opt = snap_res.as_ref().ok().map(|s| s.clone());
+        // One consistent moment for the whole source, shared by all tree
+        // methods — when the source is a btrfs subvolume. Non-subvolume trees
+        // are read live; non-tree sources (pg/podman/systemd) snapshot nothing.
+        // The snapshot is deleted only after the last method has finished
+        // (success or failure).
+        let snap_res: Option<Result<PathBuf, anyhow::Error>> =
+            it.tree.as_ref().map(|t| engine::snapshot(t));
+        let snap_opt: Option<PathBuf> = match &snap_res {
+            Some(Ok(s)) => Some(s.clone()),
+            _ => None,
+        };
         let mut guard = SnapGuard::new();
         if let Some(s) = &snap_opt {
             guard.add(s.clone());
         }
         let live_or_snap: PathBuf = match &snap_opt {
             Some(s) => s.clone(),
-            None => it.source.clone(),
+            None => it.tree.clone().unwrap_or_default(),
         };
-        let src = profile.sources.iter().find(|s| s.path == it.source)
-            .expect("plan item source must exist in profile");
         let mut m_entries: Vec<crate::manifest::MethodEntry> = Vec::new();
 
         for m in &it.methods {
@@ -398,8 +520,12 @@ pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Resu
                     let snap = match &snap_opt {
                         Some(s) => s,
                         None => {
-                            let err = format!("{} (method `btrfs` needs a btrfs subvolume)",
-                                snap_res.as_ref().unwrap_err());
+                            let snap_err = match &snap_res {
+                                Some(Err(e)) => e.to_string(),
+                                Some(Ok(_)) => unreachable!("snapshot succeeded but not recorded"),
+                                None => "no snapshot (source is not a btrfs subvolume?)".to_string(),
+                            };
+                            let err = format!("{} (method `btrfs` needs a btrfs subvolume)", snap_err);
                             any_fail = true;
                             m_entries.push(crate::manifest::MethodEntry {
                                 engine: "btrfs-send".into(),
@@ -424,7 +550,7 @@ pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Resu
                         ev,
                         &RunEvent::SourceStart {
                             idx: it.idx,
-                            label: it.source.display().to_string(),
+                            label: it.source.clone(),
                             engine: "btrfs-send".into(),
                             out_rel: m.artifact.clone(),
                         },
@@ -497,7 +623,7 @@ pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Resu
                         ev,
                         &RunEvent::SourceStart {
                             idx: it.idx,
-                            label: it.source.display().to_string(),
+                            label: it.source.clone(),
                             engine: "tar".into(),
                             out_rel: m.artifact.clone(),
                         },
@@ -505,7 +631,7 @@ pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Resu
                     let name = it.name.clone();
                     let out_c = out.clone();
                     let read_from = live_or_snap.clone();
-                    let excludes: Vec<String> = src.excludes.clone();
+                    let excludes: Vec<String> = it.excludes.clone();
                     let res = (|| -> anyhow::Result<engine::SentStream> {
                         engine::tar_stream(&engine::TarStreamConfig {
                             name: &name,
@@ -569,7 +695,7 @@ pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Resu
                         ev,
                         &RunEvent::SourceStart {
                             idx: it.idx,
-                            label: it.source.display().to_string(),
+                            label: it.source.clone(),
                             engine: "borg".into(),
                             out_rel: format!("{}::{}", bc.repo.display(), m.artifact),
                         },
@@ -580,7 +706,7 @@ pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Resu
                         snapshot: live_or_snap.clone(),
                         archive: m.artifact.clone(),
                         compression: bc.compression.clone(),
-                        excludes: src.excludes.clone(),
+                        excludes: it.excludes.clone(),
                     };
                     match crate::borg::create(&cfg) {
                         Ok((pass, bootstrapped)) => {
@@ -634,6 +760,291 @@ pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Resu
                         }
                     }
                 }
+                MethodKind::Squashfs => {
+                    let out = day.join(&m.artifact);
+                    if let Some(parent) = out.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    emit(
+                        ev,
+                        &RunEvent::SourceStart {
+                            idx: it.idx,
+                            label: it.source.clone(),
+                            engine: "squashfs".into(),
+                            out_rel: m.artifact.clone(),
+                        },
+                    );
+                    let name = it.name.clone();
+                    let out_c = out.clone();
+                    let read_from = live_or_snap.clone();
+                    let ladders = engine::squashfs_excludes(&it.excludes);
+                    let res = (|| -> anyhow::Result<engine::SentStream> {
+                        engine::squashfs(&engine::SquashfsConfig {
+                            name: &name,
+                            src: &read_from,
+                            excludes: &ladders,
+                            out: &out_c,
+                            zstd_level: profile.engines.zstd_level,
+                            on_progress: &|raw, written| {
+                                emit(ev, &RunEvent::Progress { idx: it.idx, raw, written });
+                            },
+                        })
+                    })();
+                    match res {
+                        Ok(s) => {
+                            m_entries.push(crate::manifest::MethodEntry {
+                                engine: "squashfs".into(),
+                                ok: true,
+                                error: None,
+                                snapshot: s.snapshot.display().to_string(),
+                                stream_rel: Some(m.artifact.clone()),
+                                raw_bytes: Some(s.raw_bytes),
+                                size_bytes: Some(s.size_bytes),
+                                archive: None,
+                                repo: None,
+                            });
+                            emit(
+                                ev,
+                                &RunEvent::SourceOk {
+                                    idx: it.idx,
+                                    engine: "squashfs".into(),
+                                    note: format!(
+                                        "{} raw → {} imaged ({})",
+                                        engine::human(s.raw_bytes),
+                                        engine::human(s.size_bytes),
+                                        m.artifact
+                                    ),
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            any_fail = true;
+                            m_entries.push(crate::manifest::MethodEntry {
+                                engine: "squashfs".into(),
+                                ok: false,
+                                error: Some(format!("{e:#}")),
+                                snapshot: read_from.display().to_string(),
+                                stream_rel: Some(m.artifact.clone()),
+                                raw_bytes: None,
+                                size_bytes: None,
+                                archive: None,
+                                repo: None,
+                            });
+                            emit(ev, &RunEvent::SourceFail { idx: it.idx, err: format!("{e:#}") });
+                        }
+                    }
+                }
+                MethodKind::PgDump => {
+                    let (database, user, host, port, run_as) = match &it.spec {
+                        SourceSpec::PgDump { database, user, host, port, run_as, .. } => (
+                            database.clone(),
+                            user.clone(),
+                            host.clone(),
+                            *port,
+                            run_as.clone(),
+                        ),
+                        _ => unreachable!("pg_dump method without a pg_dump source"),
+                    };
+                    let out = day.join(&m.artifact);
+                    if let Some(parent) = out.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    emit(
+                        ev,
+                        &RunEvent::SourceStart {
+                            idx: it.idx,
+                            label: it.source.clone(),
+                            engine: "pg-dump".into(),
+                            out_rel: m.artifact.clone(),
+                        },
+                    );
+                    let res = engine::pg_dump(&engine::PgDumpConfig {
+                        database: &database,
+                        user: user.as_deref(),
+                        host: host.as_deref(),
+                        port,
+                        run_as: run_as.as_deref(),
+                        out: &out,
+                    });
+                    match res {
+                        Ok(size) => {
+                            m_entries.push(crate::manifest::MethodEntry {
+                                engine: "pg-dump".into(),
+                                ok: true,
+                                error: None,
+                                snapshot: String::new(),
+                                stream_rel: Some(m.artifact.clone()),
+                                raw_bytes: None,
+                                size_bytes: Some(size),
+                                archive: None,
+                                repo: None,
+                            });
+                            emit(
+                                ev,
+                                &RunEvent::SourceOk {
+                                    idx: it.idx,
+                                    engine: "pg-dump".into(),
+                                    note: format!(
+                                        "dump of database {} → {} ({})",
+                                        database,
+                                        engine::human(size),
+                                        m.artifact
+                                    ),
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            any_fail = true;
+                            m_entries.push(crate::manifest::MethodEntry {
+                                engine: "pg-dump".into(),
+                                ok: false,
+                                error: Some(format!("{e:#}")),
+                                snapshot: String::new(),
+                                stream_rel: Some(m.artifact.clone()),
+                                raw_bytes: None,
+                                size_bytes: None,
+                                archive: None,
+                                repo: None,
+                            });
+                            emit(ev, &RunEvent::SourceFail { idx: it.idx, err: format!("{e:#}") });
+                        }
+                    }
+                }
+                MethodKind::PodmanSave => {
+                    let (images, commit, run_as) = match &it.spec {
+                        SourceSpec::PodmanSave { images, commit, run_as, .. } => (
+                            images.clone(),
+                            commit
+                                .as_ref()
+                                .map(|c| engine::PodmanCommitSpec {
+                                    container: c.container.clone(),
+                                    tag: c.tag.clone(),
+                                }),
+                            run_as.clone(),
+                        ),
+                        _ => unreachable!("podman_save method without a podman_save source"),
+                    };
+                    let out = day.join(&m.artifact);
+                    if let Some(parent) = out.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    emit(
+                        ev,
+                        &RunEvent::SourceStart {
+                            idx: it.idx,
+                            label: it.source.clone(),
+                            engine: "podman-save".into(),
+                            out_rel: m.artifact.clone(),
+                        },
+                    );
+                    let res = engine::podman_save(&engine::PodmanSaveConfig {
+                        images: &images,
+                        commit: commit.as_ref(),
+                        run_as: run_as.as_deref(),
+                        out: &out,
+                    });
+                    match res {
+                        Ok(size) => {
+                            m_entries.push(crate::manifest::MethodEntry {
+                                engine: "podman-save".into(),
+                                ok: true,
+                                error: None,
+                                snapshot: String::new(),
+                                stream_rel: Some(m.artifact.clone()),
+                                raw_bytes: None,
+                                size_bytes: Some(size),
+                                archive: None,
+                                repo: None,
+                            });
+                            emit(
+                                ev,
+                                &RunEvent::SourceOk {
+                                    idx: it.idx,
+                                    engine: "podman-save".into(),
+                                    note: format!(
+                                        "saved image(s) {} → {} ({})",
+                                        images.join(", "),
+                                        engine::human(size),
+                                        m.artifact
+                                    ),
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            any_fail = true;
+                            m_entries.push(crate::manifest::MethodEntry {
+                                engine: "podman-save".into(),
+                                ok: false,
+                                error: Some(format!("{e:#}")),
+                                snapshot: String::new(),
+                                stream_rel: Some(m.artifact.clone()),
+                                raw_bytes: None,
+                                size_bytes: None,
+                                archive: None,
+                                repo: None,
+                            });
+                            emit(ev, &RunEvent::SourceFail { idx: it.idx, err: format!("{e:#}") });
+                        }
+                    }
+                }
+                MethodKind::SystemdState => {
+                    let out = day.join(&m.artifact);
+                    if let Some(parent) = out.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    emit(
+                        ev,
+                        &RunEvent::SourceStart {
+                            idx: it.idx,
+                            label: it.source.clone(),
+                            engine: "systemd-state".into(),
+                            out_rel: m.artifact.clone(),
+                        },
+                    );
+                    let res = engine::systemd_state(&out);
+                    match res {
+                        Ok(size) => {
+                            m_entries.push(crate::manifest::MethodEntry {
+                                engine: "systemd-state".into(),
+                                ok: true,
+                                error: None,
+                                snapshot: String::new(),
+                                stream_rel: Some(m.artifact.clone()),
+                                raw_bytes: None,
+                                size_bytes: Some(size),
+                                archive: None,
+                                repo: None,
+                            });
+                            emit(
+                                ev,
+                                &RunEvent::SourceOk {
+                                    idx: it.idx,
+                                    engine: "systemd-state".into(),
+                                    note: format!(
+                                        "systemd unit states captured → {} ({})",
+                                        engine::human(size),
+                                        m.artifact
+                                    ),
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            any_fail = true;
+                            m_entries.push(crate::manifest::MethodEntry {
+                                engine: "systemd-state".into(),
+                                ok: false,
+                                error: Some(format!("{e:#}")),
+                                snapshot: String::new(),
+                                stream_rel: Some(m.artifact.clone()),
+                                raw_bytes: None,
+                                size_bytes: None,
+                                archive: None,
+                                repo: None,
+                            });
+                            emit(ev, &RunEvent::SourceFail { idx: it.idx, err: format!("{e:#}") });
+                        }
+                    }
+                }
             }
         }
 
@@ -644,7 +1055,7 @@ pub fn run(plan: &Plan, profile: &Profile, ev: &EventArc, dry_run: bool) -> Resu
 
         manifest.entries.push(crate::manifest::SourceEntry {
             name: it.name.clone(),
-            source: it.source.display().to_string(),
+            source: it.source.clone(),
             category: it.category.clone(),
             methods: m_entries,
         });
@@ -723,6 +1134,10 @@ fn engine_label(k: MethodKind) -> String {
         MethodKind::Btrfs => "btrfs-send".into(),
         MethodKind::Borg => "borg".into(),
         MethodKind::Tar => "tar".into(),
+        MethodKind::Squashfs => "squashfs".into(),
+        MethodKind::PgDump => "pg-dump".into(),
+        MethodKind::PodmanSave => "podman-save".into(),
+        MethodKind::SystemdState => "systemd-state".into(),
     }
 }
 
@@ -737,6 +1152,10 @@ fn describe_method(m: &Method, profile: &Profile) -> String {
             }
         }
         MethodKind::Tar => "tar+zstd (whole tree, excludes applied)".into(),
+        MethodKind::Squashfs => "squashfs image (zstd, excludes expanded per depth)".into(),
+        MethodKind::PgDump => "pg_dump -Fc (custom-format dump)".into(),
+        MethodKind::PodmanSave => "podman save (commit first if configured)".into(),
+        MethodKind::SystemdState => "systemctl list-unit-files snapshot".into(),
     }
 }
 

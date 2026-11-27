@@ -377,13 +377,17 @@ fn render_plan(f: &mut Frame, st: &State, area: ratatui::layout::Rect) {
             for it in &p.items {
                 lines.push(Line::from(vec![
                     Span::styled(format!("   {} → ", it.category), Style::default().fg(Color::Yellow)),
-                    Span::styled(format!("{}", it.source.display()), Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("{}", it.source.as_str()), Style::default().add_modifier(Modifier::BOLD)),
                 ]));
                 for m in &it.methods {
                     let label = match m.kind {
                         crate::plan::MethodKind::Btrfs => format!("  →  {}/{}.zst   [btrfs-send]", it.category, it.name),
                         crate::plan::MethodKind::Tar => format!("  →  {}   [tar+zstd]", m.artifact),
                         crate::plan::MethodKind::Borg => format!("  →  <repo>::{}   [borg]", m.artifact),
+                        crate::plan::MethodKind::Squashfs => format!("  →  {}   [squashfs]", m.artifact),
+                        crate::plan::MethodKind::PgDump => format!("  →  {}   [pg-dump]", m.artifact),
+                        crate::plan::MethodKind::PodmanSave => format!("  →  {}   [podman-save]", m.artifact),
+                        crate::plan::MethodKind::SystemdState => format!("  →  {}   [systemd-state]", m.artifact),
                     };
                     lines.push(Line::styled(label, Style::default().fg(Color::Green)));
                 }

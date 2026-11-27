@@ -24,7 +24,7 @@ pub struct Profile {
     pub destination: Destination,
     /// What to back up. Empty means "nothing to do" — the profile must say.
     #[serde(default)]
-    pub sources: Vec<Source>,
+    pub sources: Vec<SourceSpec>,
     #[serde(default)]
     pub engines: Engines,
     /// Method registry: settings shared by all sources that use a method.
@@ -69,41 +69,244 @@ pub enum DestinationCandidate {
     Label { label: String },
 }
 
-/// One subvolume/directory to back up.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Source {
-    /// Absolute path of the subvolume (btrfs) or directory to back up.
-    pub path: PathBuf,
-    /// Category used for the day-dir subdirectory: `os`, `home`, or `extra`.
-    #[serde(default = "default_category")]
-    pub category: String,
-    /// Human-readable label for the manifest (defaults to the path).
-    #[serde(default)]
-    pub name: Option<String>,
-    /// Which methods back up this source, in order.
-    /// Valid names: `btrfs` (snapshot stream + zstd), `borg` (deduplicated
-    /// archive into the configured repo), `tar` (whole-tree tar+zstd archive;
-    /// works on any filesystem and reads the CoW snapshot when the source is
-    /// a subvolume).
-    ///
-    /// Omitted (or `null`) → subvolumes use `btrfs`, other trees use `tar`.
-    /// A source can use any number of methods —
-    /// e.g. `[btrfs, borg]` produces both a fast stream and an incremental,
-    /// deduplicated copy from the *same* consistent snapshot.
-    #[serde(default)]
-    pub methods: Option<Vec<String>>,
-    /// Exclusion patterns — one list, applied by both tar and borg.
-    /// Recommended portable form: `**/blobs` (skips `blobs/` at any depth;
-    /// verified against GNU tar and borg 1.4.5). Plain `blobs` works for tar
-    /// only — borg anchors patterns. btrfs streams carry the whole subvolume
-    /// — excludes do not apply to them.
-    #[serde(default)]
-    pub excludes: Vec<String>,
-}
-
 fn default_category() -> String {
     "extra".into()
+}
+
+/// `podman commit <container> <tag>` before the save (live quadlet state).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PodmanCommit {
+    pub container: String,
+    pub tag: String,
+}
+
+/// One entry under `sources:` — what to back up and, for trees, how.
+///
+/// Kinds:
+/// - `tree` (the default when `path:` is given — legacy profiles without
+///   `kind:` still parse): a subvolume or directory, read by its methods.
+/// - `pg_dump`: a PostgreSQL database, `pg_dump -Fc` custom-format dump.
+/// - `podman_save`: container images to a tar; optionally `commit` a live
+///   container first (the quadlet case: commit takes a consistent CoW state).
+/// - `systemd_state`: `systemctl list-unit-files` snapshot for bare-metal
+///   restore (re-enable the same units on a fresh install).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum SourceSpec {
+    Tree {
+        /// Absolute path of the subvolume (btrfs) or directory to back up.
+        path: PathBuf,
+        /// Category used for the day-dir subdirectory: `os`, `home`, or `extra`.
+        #[serde(default = "default_category")]
+        category: String,
+        /// Human-readable label for the manifest (defaults to the path).
+        #[serde(default)]
+        name: Option<String>,
+        /// Which methods back up this source, in order.
+        /// Valid names: `btrfs` (snapshot stream + zstd), `borg` (deduplicated
+        /// archive into the configured repo), `tar` (whole-tree tar+zstd
+        /// archive; works on any filesystem), `squashfs` (read-only
+        /// `.squashfs` image of the tree).
+        ///
+        /// Omitted (or `null`) → subvolumes use `btrfs`, other trees use `tar`.
+        /// A source can use any number of methods — e.g. `[btrfs, borg]`
+        /// produces both a fast stream and an incremental, deduplicated copy
+        /// from the *same* consistent snapshot.
+        #[serde(default)]
+        methods: Option<Vec<String>>,
+        /// Exclusion patterns — one portable list, applied by tar, borg and
+        /// squashfs (keel adapts each engine's pattern language; the portable
+        /// form is `**/name`, verified against GNU tar, borg 1.4.5 and
+        /// squashfs-tools 4.7.4). btrfs streams carry the whole subvolume —
+        /// excludes do not apply to them.
+        #[serde(default)]
+        excludes: Vec<String>,
+    },
+    PgDump {
+        /// Database name to dump.
+        database: String,
+        /// DB user (`pg_dump -U`).
+        #[serde(default)]
+        user: Option<String>,
+        /// Server host (`pg_dump -h`); omitted = local socket.
+        #[serde(default)]
+        host: Option<String>,
+        /// Server port (`pg_dump -p`).
+        #[serde(default)]
+        port: Option<u16>,
+        /// OS user to run `pg_dump` as (e.g. `postgres`) via `runuser`;
+        /// keel itself runs as root.
+        #[serde(default)]
+        run_as: Option<String>,
+        #[serde(default = "default_category")]
+        category: String,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    PodmanSave {
+        /// Image refs to `podman save` (e.g. `localhost/devenv:44`).
+        /// Required unless `commit` is the only source of an image.
+        #[serde(default)]
+        images: Vec<String>,
+        /// First `podman commit <container> <tag>` (consistent CoW state of a
+        /// live container, like the legacy script's quadlet save), then save
+        /// that tag too.
+        #[serde(default)]
+        commit: Option<PodmanCommit>,
+        /// OS user to run podman as (e.g. `dns`) via `runuser`.
+        #[serde(default)]
+        run_as: Option<String>,
+        #[serde(default = "default_category")]
+        category: String,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    SystemdState {
+        #[serde(default = "default_category")]
+        category: String,
+        #[serde(default)]
+        name: Option<String>,
+    },
+}
+
+impl SourceSpec {
+    pub fn category(&self) -> String {
+        match self {
+            SourceSpec::Tree { category, .. } => category.clone(),
+            SourceSpec::PgDump { category, .. } => category.clone(),
+            SourceSpec::PodmanSave { category, .. } => category.clone(),
+            SourceSpec::SystemdState { category, .. } => category.clone(),
+        }
+    }
+    pub fn name(&self) -> Option<String> {
+        match self {
+            SourceSpec::Tree { name, .. } => name.clone(),
+            SourceSpec::PgDump { name, .. } => name.clone(),
+            SourceSpec::PodmanSave { name, .. } => name.clone(),
+            SourceSpec::SystemdState { name, .. } => name.clone(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SourceSpec {
+    /// Accepts the legacy form (a tree source with no `kind:` key) plus the
+    /// four explicit kinds. Unknown kinds and unknown fields are rejected.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            #[serde(default)]
+            kind: Option<String>,
+            // tree
+            #[serde(default)]
+            path: Option<PathBuf>,
+            #[serde(default)]
+            methods: Option<Vec<String>>,
+            #[serde(default)]
+            excludes: Option<Vec<String>>,
+            // shared
+            #[serde(default)]
+            category: Option<String>,
+            #[serde(default)]
+            name: Option<String>,
+            // pg_dump
+            #[serde(default)]
+            database: Option<String>,
+            #[serde(default)]
+            user: Option<String>,
+            #[serde(default)]
+            host: Option<String>,
+            #[serde(default)]
+            port: Option<u16>,
+            #[serde(default)]
+            run_as: Option<String>,
+            // podman_save
+            #[serde(default)]
+            images: Option<Vec<String>>,
+            #[serde(default)]
+            commit: Option<PodmanCommit>,
+        }
+        let r: Raw = Raw::deserialize(d)?;
+        let cat = r.category.unwrap_or_else(default_category);
+        let inf = |what: &str| {
+            D::Error::custom(format!(
+                "source has a {what} field but no matching kind — set kind: {} explicitly",
+                what
+            ))
+        };
+        let kind = match r.kind {
+            Some(k) => k,
+            // No explicit kind: infer from the identifying fields (legacy
+            // profiles use `path:` with no kind at all).
+            None => {
+                if r.path.is_some() && (r.database.is_some() || r.images.is_some() || r.commit.is_some()) {
+                    return Err(inf("conflicting"));
+                }
+                if r.path.is_some() {
+                    "tree".into()
+                } else if r.database.is_some() {
+                    "pg_dump".into()
+                } else if r.images.is_some() || r.commit.is_some() {
+                    "podman_save".into()
+                } else {
+                    "systemd_state".into()
+                }
+            }
+        };
+        match kind.as_str() {
+            "tree" => {
+                let path = r.path.ok_or_else(|| D::Error::custom("kind: tree needs `path`"))?;
+                Ok(SourceSpec::Tree {
+                    path,
+                    category: cat,
+                    name: r.name,
+                    methods: r.methods,
+                    excludes: r.excludes.unwrap_or_default(),
+                })
+            }
+            "pg_dump" => {
+                let database = r
+                    .database
+                    .ok_or_else(|| D::Error::custom("kind: pg_dump needs `database`"))?;
+                if r.path.is_some() {
+                    return Err(inf("tree/`path`"));
+                }
+                Ok(SourceSpec::PgDump {
+                    database,
+                    user: r.user,
+                    host: r.host,
+                    port: r.port,
+                    run_as: r.run_as,
+                    category: cat,
+                    name: r.name,
+                })
+            }
+            "podman_save" => {
+                if r.path.is_some() || r.database.is_some() {
+                    return Err(inf("tree/`path` or pg_dump/`database`"));
+                }
+                Ok(SourceSpec::PodmanSave {
+                    images: r.images.unwrap_or_default(),
+                    commit: r.commit,
+                    run_as: r.run_as,
+                    category: cat,
+                    name: r.name,
+                })
+            }
+            "systemd_state" => {
+                if r.path.is_some() || r.database.is_some() || r.images.is_some() || r.commit.is_some() {
+                    return Err(inf("tree/pg_dump/podman_save"));
+                }
+                Ok(SourceSpec::SystemdState { category: cat, name: r.name })
+            }
+            other => Err(D::Error::custom(format!(
+                "unknown source kind {other:?} (valid: tree, pg_dump, podman_save, systemd_state)"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,7 +499,10 @@ retention:
 "#;
         let p: Profile = serde_yaml::from_str(yaml).unwrap();
         assert!(p.methods.borg.is_none());
-        assert!(p.sources[0].methods.is_none());
+        match &p.sources[0] {
+            crate::profile::SourceSpec::Tree { methods, .. } => assert!(methods.is_none()),
+            _ => panic!("legacy `path:` source must parse as a tree"),
+        }
         assert_eq!(p.engines.zstd_level, 6);
     }
 
@@ -321,13 +527,91 @@ retention:
   keep: 2
 "#;
         let p: Profile = serde_yaml::from_str(yaml).unwrap();
-        let m = p.sources[0].methods.as_ref().unwrap();
-        assert_eq!(m, &vec!["btrfs".to_string(), "borg".to_string()]);
+        let (m, ex) = match &p.sources[0] {
+            crate::profile::SourceSpec::Tree { methods, excludes, .. } => (methods.clone(), excludes.clone()),
+            _ => panic!("multi-method source must parse as a tree"),
+        };
+        assert_eq!(m, Some(vec!["btrfs".to_string(), "borg".to_string()]));
         let bc = p.methods.borg.as_ref().unwrap();
         assert_eq!(bc.compression, "zstd,6");
         assert_eq!(bc.keep_daily, 2);
         assert_eq!(bc.keep_weekly, 4);
         assert_eq!(bc.keep_monthly, 12);
-        assert_eq!(p.sources[0].excludes.len(), 1);
+        assert_eq!(ex.len(), 1);
+    }
+
+    #[test]
+    fn new_source_kinds_parse() {
+        let yaml = r#"
+name: kinds
+destination:
+  mount_point: /mnt/x
+sources:
+  - kind: pg_dump
+    database: weather
+    run_as: postgres
+    category: extra
+  - kind: podman_save
+    images: [localhost/devenv:44]
+    commit:
+      container: dns
+      tag: localhost/pihole-kr:backup-1
+    run_as: dns
+  - kind: systemd_state
+  - kind: tree
+    path: /boot
+    methods: [squashfs]
+"#;
+        let p: Profile = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.sources.len(), 4);
+        match &p.sources[0] {
+            crate::profile::SourceSpec::PgDump { database, run_as, .. } => {
+                assert_eq!(database, "weather");
+                assert_eq!(run_as.as_deref(), Some("postgres"));
+            }
+            _ => panic!("sources[0] must be pg_dump"),
+        }
+        match &p.sources[1] {
+            crate::profile::SourceSpec::PodmanSave { images, commit, run_as, .. } => {
+                assert_eq!(images, &vec!["localhost/devenv:44".to_string()]);
+                let c = commit.as_ref().unwrap();
+                assert_eq!(c.container, "dns");
+                assert_eq!(run_as.as_deref(), Some("dns"));
+            }
+            _ => panic!("sources[1] must be podman_save"),
+        }
+        match &p.sources[2] {
+            crate::profile::SourceSpec::SystemdState { .. } => {}
+            _ => panic!("sources[2] must be systemd_state"),
+        }
+        match &p.sources[3] {
+            crate::profile::SourceSpec::Tree { path, methods, .. } => {
+                assert_eq!(path.to_str().unwrap(), "/boot");
+                assert_eq!(methods.as_deref(), Some(["squashfs".to_string()].as_slice()));
+            }
+            _ => panic!("sources[3] must be tree"),
+        }
+    }
+
+    #[test]
+    fn unknown_kind_and_fields_rejected() {
+        let bad_kind = r#"
+name: x
+destination:
+  mount_point: /m
+sources:
+  - kind: floppy
+    path: /x
+"#;
+        assert!(serde_yaml::from_str::<Profile>(bad_kind).is_err());
+        let bad_field = r#"
+name: x
+destination:
+  mount_point: /m
+sources:
+  - path: /x
+    btrfs_only: true
+"#;
+        assert!(serde_yaml::from_str::<Profile>(bad_field).is_err());
     }
 }

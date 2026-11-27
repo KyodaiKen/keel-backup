@@ -147,14 +147,18 @@ sources:
   # Per-source extras (all optional):
   #   name: home                  # manifest label (defaults to the path name)
   #   category: home              # day-dir subdirectory (os/home/boot/…)
-  #   methods: [btrfs, borg]      # default: btrfs on subvolumes, tar elsewhere
-  #   excludes: ["ollama-models/blobs"]   # tar globs / borg patterns; btrfs streams are whole-subvolume
+  #   methods: [btrfs, borg, tar, squashfs]  # default: btrfs on subvolumes, tar elsewhere
+  #   excludes: ["ollama-models/blobs"]      # tar globs / borg patterns; squashfs simple names expand per depth; btrfs streams are whole-subvolume
+  # Tree extras beyond that: `path` (required), `name`, `category`.
+  # Non-tree sources (kind:):  pg_dump {{database, user, host, port, run_as}}
+  #                             podman_save {{images, commit {{container, tag}}, run_as}}
+  #                             systemd_state {{}}
 {srcs}
 engines:
   zstd_level: 6
   zstd_threads: null   # null = auto
 
-# methods:      # method settings (sources opt in via `methods: [btrfs, borg, tar]`)
+# methods:      # method settings (sources opt in via `methods: [btrfs, borg, tar, squashfs]`)
 #   borg:
 #     repo: /mnt/backup/borg-backups        # shared repo on the backup drive
 #     passphrase_file: ~/secrets/borg.bp    # 0400, one line; opens pre-existing repos
@@ -186,14 +190,18 @@ fn cmd_plan(profile_ref: Option<&str>) -> Result<()> {
     for it in &p.items {
         for m in &it.methods {
             match m.kind {
-                plan::MethodKind::Btrfs => println!("  {}/{}  ←  {}  [btrfs-send]", it.category, it.name, it.source.display()),
-                plan::MethodKind::Tar => println!("  {}/{}  ←  {}  [tar+zstd]", it.category, it.name, it.source.display()),
+                plan::MethodKind::Btrfs => println!("  {}/{}  ←  {}  [btrfs-send]", it.category, it.name, it.source.as_str()),
+                plan::MethodKind::Tar => println!("  {}/{}  ←  {}  [tar+zstd]", it.category, it.name, it.source.as_str()),
                 plan::MethodKind::Borg => {
                     let repo = prof.methods.borg.as_ref()
                         .map(|b| b.repo.display().to_string())
                         .unwrap_or_else(|| "<repo>".into());
-                    println!("  {}  ←  {}  [borg → {}::{}]", it.name, it.source.display(), repo, m.artifact);
+                    println!("  {}  ←  {}  [borg → {}::{}]", it.name, it.source.as_str(), repo, m.artifact);
                 }
+                plan::MethodKind::Squashfs => println!("  {}  ←  {}  [squashfs]", it.name, it.source.as_str()),
+                plan::MethodKind::PgDump => println!("  {}  ←  {}  [pg-dump]", it.name, it.source.as_str()),
+                plan::MethodKind::PodmanSave => println!("  {}  ←  {}  [podman-save]", it.name, it.source.as_str()),
+                plan::MethodKind::SystemdState => println!("  {}  ←  {}  [systemd-state]", it.name, it.source.as_str()),
             }
         }
     }

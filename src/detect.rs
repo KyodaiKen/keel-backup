@@ -213,7 +213,7 @@ pub fn registry() -> Vec<Capability> {
             "mksquashfs missing".into()
         },
         evidence: vec![format!("mksquashfs = {:?}", squash_bin)],
-        implemented: false,
+        implemented: true,
     });
 
     caps.push(Capability {
@@ -239,7 +239,7 @@ pub fn registry() -> Vec<Capability> {
             "pg_dump missing (no PostgreSQL tools found)".into()
         },
         evidence: vec![format!("pg_dump = {:?}", pg_bin)],
-        implemented: false,
+        implemented: true,
     });
 
     caps.push(Capability {
@@ -252,7 +252,20 @@ pub fn registry() -> Vec<Capability> {
             "podman missing".into()
         },
         evidence: vec![format!("podman = {:?}", podman_bin)],
-        implemented: false,
+        implemented: true,
+    });
+
+    caps.push(Capability {
+        id: "systemd-state",
+        title: "systemctl list-unit-files — unit state snapshot".into(),
+        applicable: which("systemctl").is_some(),
+        reason: if which("systemctl").is_some() {
+            "enabled/masked unit list captured for bare-metal restore".into()
+        } else {
+            "systemctl missing (not a systemd host?)".into()
+        },
+        evidence: vec![format!("systemctl = {:?}", which("systemctl"))],
+        implemented: true,
     });
 
     caps.push(Capability {

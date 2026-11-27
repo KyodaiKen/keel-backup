@@ -2,8 +2,8 @@
 
 **Profile-driven, distribution-agnostic, bare-metal-capable system backups — written in Rust.**
 
-`keel` detects what your system *can* be backed up with (btrfs subvolumes today,
-tar+zstd / squashfs / borg / pg-dump / podman-save in later phases), plans a
+`keel` detects what your system *can* be backed up with (btrfs subvolumes,
+tar+zstd, squashfs, borg, pg-dump, podman-save, systemd unit state), plans a
 consistent snapshot set from your **profile YAML**, and streams compressed,
 verified backups to a second drive — with real progress feedback in a TUI
 or in the terminal.
@@ -26,8 +26,14 @@ system.
 - Engines:
   - **btrfs-send → zstd** streams with real byte-counting progress (no `pv`)
   - **tar + zstd** whole-tree archives — any filesystem; honors `excludes`
+  - **squashfs** single-file images (zstd) — portable, `unsquashfs` anywhere;
+    `excludes` simple names are expanded into a depth ladder (mksquashfs has no `**`)
   - **borg** — deduplicated, incremental repokey archives; passphrase
     bootstrap or hard refusal (never invents one), prune, `excludes`
+- Sources beyond trees (each one self-contained, root-free where possible):
+  - **pg_dump** — `pg_dump -Fc` custom-format dumps (optionally as another user via `run_as`)
+  - **podman_save** — save container images; optional `podman commit` of a live container first
+  - **systemd_state** — `systemctl list-unit-files` captured to YAML for bare-metal restore
 - A source can use several engines — `methods: [btrfs, borg]` gives both a
   fast stream and a deduplicated copy from the *same* consistent snapshot
 - `manifest.yaml` receipt per backup day (what was taken, where, how to restore)
@@ -37,8 +43,8 @@ system.
 
 ## Later phases
 
-1. ~~tar+zstd engine (non-btrfs trees)~~ ✅ · squashfs engine — pending
-2. ~~borg (env-file passphrase)~~ ✅ · pg-dump, podman-save, systemd state — pending
+1. ~~tar+zstd engine (non-btrfs trees)~~ ✅ · ~~squashfs engine~~ ✅
+2. ~~borg (env-file passphrase)~~ ✅ · ~~pg-dump, podman-save, systemd state~~ ✅
 3. GPT/EFI/creds bare-metal dump + **generated live-media restore script**
 4. `musl` static binary, packaging
 
@@ -87,6 +93,18 @@ sources:
   - path: /home
     category: home
     name: home
+    methods: [squashfs]          # or [btrfs, borg, tar] — mix freely
+    excludes:
+      - cache                    # simple name → depth ladder for squashfs
+  - kind: pg_dump                # any postgres database
+    database: weather
+    category: data
+  - kind: podman_save            # container images (+ optional commit of a live container)
+    images:
+      - localhost/devenv:44
+    category: containers
+  - kind: systemd_state          # unit files + states for bare-metal restore
+    category: extra
 engines:
   zstd_level: 6
 retention:
@@ -105,7 +123,10 @@ cargo build --release --target x86_64-unknown-linux-musl
 ```
 
 Requires at runtime: `btrfs-progs`, `zstd`, `coreutils` (df, find).
-Runs as root (snapshots, mounting).
+Optional per engine/source: `squashfs-tools` (mksquashfs), `borgbackup`,
+`postgresql` client (pg_dump), `podman`, `systemd` (systemctl).
+Runs as root (snapshots, mounting); tree-free profiles can run unprivileged
+if you drop the root check — today `keel run` always wants root.
 
 ## License
 
