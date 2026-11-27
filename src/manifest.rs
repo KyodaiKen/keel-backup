@@ -97,9 +97,9 @@ impl RunManifest {
             complete: false,
             entries: Vec::new(),
             restore_hint: if has_borg {
-                "btrfs streams: `zstd -d < day/.../os/rootfs.zst | btrfs receive /target` (creates /target/<source>); borg archives: `borg extract <repo>::<archive> /target` (file-level) or `borg mount` (Phase 1 ships a generated live-media restore script)".into()
+                "btrfs streams: `zstd -dc < day/.../os/rootfs.zst | btrfs receive /target` (target on a btrfs fs; creates /target/<source>); borg archives: `borg extract <repo>::<archive> /target` (paths stored root-relative, e.g. home/kyo/...; whole-tree or per-file) or `borg mount` (Phase 1 ships a generated live-media restore script)".into()
             } else {
-                "btrfs send/receive streams: `zstd -d < day/.../os/rootfs.zst | btrfs receive /target` creates /target/<source> (Phase 1 ships a generated live-media restore script)".into()
+                "btrfs send/receive streams: `zstd -dc < day/.../os/rootfs.zst | btrfs receive /target` (target on a btrfs fs; creates /target/<source>; Phase 1 ships a generated live-media restore script)".into()
             },
         }
     }

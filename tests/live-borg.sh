@@ -10,17 +10,20 @@
 # Needs root (snapshots + btrfs). Run:  sudo bash tests/live-borg.sh
 set -u
 
-KEEL="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/release/keel"
+KEEL="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/debug/keel"
 SNAP="/keel-live"
 DEST="/tmp/keel-live-dest"
 REPO="/tmp/borg-keel-test"
 BP="/tmp/keel-bp-test"
-RECV="/tmp/keel-live-recv"
+RECV="/keel-live-recv"   # must be on a btrfs fs (/tmp is not btrfs)
 PROFILE="/tmp/keel-live-profile.yaml"
 FAIL=0
 
 cleanup() {
     btrfs subvolume delete "$SNAP" 2>/dev/null
+    # received subvolumes must be deleted as subvolumes before rm -rf
+    local sv
+    while IFS= read -r sv; do btrfs subvolume delete "$sv" 2>/dev/null; done < <(find "$RECV" -type d 2>/dev/null)
     rm -rf "$DEST" "$REPO" "$BP" "$RECV" "$PROFILE"
 }
 trap cleanup EXIT
@@ -102,11 +105,17 @@ echo "$list1"
 n1=$(echo "$list1" | grep -c 'live-[0-9]')
 [ "$n1" -ge 1 ]; check $? "repo has >=1 archive (found $n1)"
 
-step "verify borg content (extract --stdout)"
+step "verify borg content (extract)"
+# borg stores paths relative to the filesystem root (keel-live/hello.txt),
+# so extract the whole archive to a scratch dir and locate the file
 arch1=$(echo "$list1" | grep 'live-[0-9]' | tail -1)
-out=$(BORG_PASSPHRASE="$(cat "$BP")" BORG_RELOCATED_REPO_ACCESS_IS_OK=yes borg extract --stdout "$REPO::$arch1" hello.txt)
+EXT1="/tmp/keel-borg-ext1"
+rm -rf "$EXT1"; mkdir -p "$EXT1"
+BORG_PASSPHRASE="$(cat "$BP")" BORG_RELOCATED_REPO_ACCESS_IS_OK=yes borg extract "$REPO::$arch1" "$EXT1" 2>/dev/null
+out=$(find "$EXT1" -name hello.txt 2>/dev/null | head -1 | xargs -r cat)
 echo "$out"
 [ "$out" = "$(cat "$SNAP/hello.txt")" ]; check $? "borg-extracted hello.txt matches original"
+rm -rf "$EXT1"
 
 # --- run 2 (same day → exercises prune keep_daily=1) ------------------------
 sleep 2   # archive names carry seconds — guarantee distinct names
@@ -119,8 +128,12 @@ echo "$list2"
 n2=$(echo "$list2" | grep -c 'live-[0-9]')
 [ "$n2" -eq 1 ]; check $? "exactly 1 archive after prune (keep_daily=1, found $n2)"
 arch2=$(echo "$list2" | grep 'live-[0-9]' | tail -1)
-out2=$(BORG_PASSPHRASE="$(cat "$BP")" BORG_RELOCATED_REPO_ACCESS_IS_OK=yes borg extract --stdout "$REPO::$arch2" hello.txt)
+EXT2="/tmp/keel-borg-ext2"
+rm -rf "$EXT2"; mkdir -p "$EXT2"
+BORG_PASSPHRASE="$(cat "$BP")" BORG_RELOCATED_REPO_ACCESS_IS_OK=yes borg extract "$REPO::$arch2" "$EXT2" 2>/dev/null
+out2=$(find "$EXT2" -name hello.txt 2>/dev/null | head -1 | xargs -r cat)
 [ "$out2" = "$(cat "$SNAP/hello.txt")" ]; check $? "retained archive still readable"
+rm -rf "$EXT2"
 
 step "NEGATIVE TEST: missing passphrase file + existing repo must REFUSE"
 mv "$BP" "$BP.hidden"
